@@ -174,6 +174,15 @@ export default async function handler(req, res) {
         TargetImage: { Bytes: docBuffer },
         SimilarityThreshold: 80
       }));
+
+// ADD THESE LINES HERE:
+console.log('CompareFaces result:', JSON.stringify(compareResult, null, 2));
+console.log('Face matches found:', compareResult.FaceMatches?.length);
+
+if (!compareResult.FaceMatches || compareResult.FaceMatches.length === 0) {
+  console.log('No face detected in document image!');
+  console.log('UnmatchedFaces:', compareResult.UnmatchedFaces);
+}
       
       const similarity = (compareResult.FaceMatches?.[0]?.Similarity || 0) / 100;
       
