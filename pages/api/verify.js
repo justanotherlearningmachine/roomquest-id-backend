@@ -1,5 +1,5 @@
 import { createClient } from '@supabase/supabase-js';
-import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import { RekognitionClient, CompareFacesCommand, DetectFacesCommand } from '@aws-sdk/client-rekognition';
 import { TextractClient, AnalyzeDocumentCommand } from '@aws-sdk/client-textract';
 
@@ -15,6 +15,18 @@ const textract = new TextractClient({ region: process.env.AWS_REGION });
 const BUCKET = process.env.S3_BUCKET_NAME;
 
 export default async function handler(req, res) {
+  // CORS headers
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
+  res.setHeader('Access-Control-Allow-Headers', 'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version');
+
+  // Handle OPTIONS request
+  if (req.method === 'OPTIONS') {
+    res.status(200).end();
+    return;
+  }
+
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
@@ -22,7 +34,6 @@ export default async function handler(req, res) {
   const { action } = req.body;
 
   try {
-    // ACTION 1: START SESSION
     if (action === 'start') {
       const token = Math.random().toString(36).substring(2, 15);
       
@@ -38,13 +49,11 @@ export default async function handler(req, res) {
       });
     }
 
-    // ACTION 2: UPLOAD DOCUMENT
     if (action === 'upload_document') {
       const { session_token, image_base64, guest_name, room_number } = req.body;
       
       const imageBuffer = Buffer.from(image_base64, 'base64');
       
-      // Upload to S3
       const s3Key = `demo/${session_token}/document.jpg`;
       await s3.send(new PutObjectCommand({
         Bucket: BUCKET,
@@ -55,7 +64,6 @@ export default async function handler(req, res) {
       
       const documentUrl = `https://${BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/${s3Key}`;
       
-      // Run Textract
       const textractResult = await textract.send(new AnalyzeDocumentCommand({
         Document: { Bytes: imageBuffer },
         FeatureTypes: ['FORMS']
@@ -66,7 +74,6 @@ export default async function handler(req, res) {
         .map(b => b.Text)
         .join(' ') || '';
       
-      // Save to database
       await supabase
         .from('demo_sessions')
         .update({
@@ -78,7 +85,6 @@ export default async function handler(req, res) {
         })
         .eq('session_token', session_token);
       
-      // Track cost
       await supabase.from('demo_api_costs').insert({
         session_id: session_token,
         operation: 'textract',
@@ -91,11 +97,9 @@ export default async function handler(req, res) {
       });
     }
 
-    // ACTION 3: VERIFY FACE
     if (action === 'verify_face') {
       const { session_token, selfie_base64 } = req.body;
       
-      // Get session
       const { data: session } = await supabase
         .from('demo_sessions')
         .select('*')
@@ -108,7 +112,6 @@ export default async function handler(req, res) {
       
       const selfieBuffer = Buffer.from(selfie_base64, 'base64');
       
-      // Upload selfie
       const selfieKey = `demo/${session_token}/selfie.jpg`;
       await s3.send(new PutObjectCommand({
         Bucket: BUCKET,
@@ -119,7 +122,6 @@ export default async function handler(req, res) {
       
       const selfieUrl = `https://${BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/${selfieKey}`;
       
-      // Liveness check
       const livenessResult = await rekognition.send(new DetectFacesCommand({
         Image: { Bytes: selfieBuffer },
         Attributes: ['ALL']
@@ -129,11 +131,9 @@ export default async function handler(req, res) {
       const isLive = face?.EyesOpen?.Value && face?.Quality?.Brightness > 40;
       const livenessScore = (face?.Confidence || 0) / 100;
       
-      // Download document for comparison
       const docResponse = await fetch(session.document_url);
       const docBuffer = Buffer.from(await docResponse.arrayBuffer());
       
-      // Compare faces
       const compareResult = await rekognition.send(new CompareFacesCommand({
         SourceImage: { Bytes: selfieBuffer },
         TargetImage: { Bytes: docBuffer },
@@ -145,7 +145,6 @@ export default async function handler(req, res) {
       const verificationScore = (isLive ? 0.4 : 0) + (livenessScore * 0.3) + (similarity * 0.3);
       const isVerified = isLive && similarity >= 0.85;
       
-      // Update session
       await supabase
         .from('demo_sessions')
         .update({
@@ -156,13 +155,11 @@ export default async function handler(req, res) {
         })
         .eq('session_token', session_token);
       
-      // Track costs
       await supabase.from('demo_api_costs').insert([
         { session_id: session_token, operation: 'liveness', cost_usd: 0.001 },
         { session_id: session_token, operation: 'face_compare', cost_usd: 0.001 }
       ]);
       
-      // Update stats
       await supabase.rpc('increment_demo_stats', {
         verified: isVerified,
         cost: 0.052
