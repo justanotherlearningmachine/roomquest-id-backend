@@ -178,7 +178,7 @@ export default async function handler(req, res) {
       const similarity = (compareResult.FaceMatches?.[0]?.Similarity || 0) / 100;
       
       const verificationScore = (isLive ? 0.4 : 0) + (livenessScore * 0.3) + (similarity * 0.3);
-      const isVerified = isLive && similarity >= 0.85;
+      const isVerified = isLive && similarity >= 0.50;
       
       await supabase
         .from('demo_sessions')
