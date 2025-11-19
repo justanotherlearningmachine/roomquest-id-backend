@@ -52,9 +52,14 @@ export default async function handler(req, res) {
     if (action === 'upload_document') {
       const { session_token, image_data, guest_name, room_number } = req.body;
       
+      console.log('Received image_data type:', typeof image_data);
+      console.log('Image_data length:', image_data?.length);
+      
       // Remove data URL prefix if present
       const base64Data = image_data.replace(/^data:image\/\w+;base64,/, '');
       const imageBuffer = Buffer.from(base64Data, 'base64');
+      
+      console.log('Buffer size:', imageBuffer.length);
       
       const s3Key = `demo/${session_token}/document.jpg`;
       await s3.send(new PutObjectCommand({
@@ -67,18 +72,6 @@ export default async function handler(req, res) {
       const documentUrl = `https://s3.${process.env.AWS_REGION}.amazonaws.com/${BUCKET}/${s3Key}`;
       
       // TEXTRACT DISABLED - Skip text extraction for now
-      /*
-      const textractResult = await textract.send(new AnalyzeDocumentCommand({
-        Document: { Bytes: imageBuffer },
-        FeatureTypes: ['FORMS']
-      }));
-      
-      const extractedText = textractResult.Blocks
-        ?.filter(b => b.BlockType === 'LINE')
-        .map(b => b.Text)
-        .join(' ') || '';
-      */
-      
       const extractedText = 'Text extraction disabled (pending AWS activation)';
       
       await supabase
@@ -92,15 +85,6 @@ export default async function handler(req, res) {
         })
         .eq('session_token', session_token);
       
-      // TEXTRACT COST DISABLED
-      /*
-      await supabase.from('demo_api_costs').insert({
-        session_id: session_token,
-        operation: 'textract',
-        cost_usd: 0.05
-      });
-      */
-      
       return res.json({ 
         success: true,
         extracted_text: extractedText.substring(0, 200)
@@ -109,6 +93,10 @@ export default async function handler(req, res) {
 
     if (action === 'verify_face') {
       const { session_token, selfie_data } = req.body;
+      
+      console.log('Received selfie_data type:', typeof selfie_data);
+      console.log('Selfie_data length:', selfie_data?.length);
+      console.log('First 100 chars:', selfie_data?.substring(0, 100));
       
       const { data: session } = await supabase
         .from('demo_sessions')
@@ -120,9 +108,30 @@ export default async function handler(req, res) {
         return res.status(400).json({ error: 'Document not uploaded' });
       }
       
-      // Remove data URL prefix if present
-      const base64Data = selfie_data.replace(/^data:image\/\w+;base64,/, '');
+      // Handle selfie_data - could be string or already base64
+      let base64Data;
+      if (typeof selfie_data === 'string') {
+        // Remove data URL prefix if present
+        base64Data = selfie_data.replace(/^data:image\/\w+;base64,/, '');
+      } else {
+        return res.status(400).json({ error: 'Invalid selfie_data format - must be string' });
+      }
+      
+      console.log('Cleaned base64 length:', base64Data.length);
+      console.log('First 50 chars of cleaned:', base64Data.substring(0, 50));
+      
+      // Validate base64
+      if (!/^[A-Za-z0-9+/]+=*$/.test(base64Data.substring(0, 100))) {
+        console.error('Invalid base64 detected');
+        return res.status(400).json({ error: 'Invalid base64 encoding' });
+      }
+      
       const selfieBuffer = Buffer.from(base64Data, 'base64');
+      console.log('Selfie buffer size:', selfieBuffer.length);
+      
+      if (selfieBuffer.length < 1000) {
+        return res.status(400).json({ error: 'Image too small - invalid data' });
+      }
       
       const selfieKey = `demo/${session_token}/selfie.jpg`;
       await s3.send(new PutObjectCommand({
@@ -134,6 +143,7 @@ export default async function handler(req, res) {
       
       const selfieUrl = `https://s3.${process.env.AWS_REGION}.amazonaws.com/${BUCKET}/${selfieKey}`;
       
+      console.log('Calling Rekognition DetectFaces...');
       const livenessResult = await rekognition.send(new DetectFacesCommand({
         Image: { Bytes: selfieBuffer },
         Attributes: ['ALL']
@@ -143,9 +153,11 @@ export default async function handler(req, res) {
       const isLive = face?.EyesOpen?.Value && face?.Quality?.Brightness > 40;
       const livenessScore = (face?.Confidence || 0) / 100;
       
+      console.log('Fetching document from S3...');
       const docResponse = await fetch(session.document_url);
       const docBuffer = Buffer.from(await docResponse.arrayBuffer());
       
+      console.log('Calling Rekognition CompareFaces...');
       const compareResult = await rekognition.send(new CompareFacesCommand({
         SourceImage: { Bytes: selfieBuffer },
         TargetImage: { Bytes: docBuffer },
@@ -193,6 +205,10 @@ export default async function handler(req, res) {
     
   } catch (error) {
     console.error('Error:', error);
-    return res.status(500).json({ error: error.message });
+    return res.status(500).json({ 
+      error: error.message,
+      code: error.code,
+      name: error.name
+    });
   }
 }
