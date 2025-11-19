@@ -70,6 +70,7 @@ export default async function handler(req, res) {
       }));
       
       const documentUrl = `https://s3.${process.env.AWS_REGION}.amazonaws.com/${BUCKET}/${s3Key}`;
+      console.log('Document uploaded to:', documentUrl);
       
       // TEXTRACT DISABLED - Skip text extraction for now
       const extractedText = 'Text extraction disabled (pending AWS activation)';
@@ -153,9 +154,19 @@ export default async function handler(req, res) {
       const isLive = face?.EyesOpen?.Value && face?.Quality?.Brightness > 40;
       const livenessScore = (face?.Confidence || 0) / 100;
       
+      console.log('Document URL:', session.document_url);
       console.log('Fetching document from S3...');
       const docResponse = await fetch(session.document_url);
-      const docBuffer = Buffer.from(await docResponse.arrayBuffer());
+      console.log('Document fetch status:', docResponse.status, docResponse.ok);
+      
+      if (!docResponse.ok) {
+        throw new Error(`Failed to fetch document from S3: ${docResponse.status}`);
+      }
+      
+      const docArrayBuffer = await docResponse.arrayBuffer();
+      console.log('Document array buffer size:', docArrayBuffer.byteLength);
+      const docBuffer = Buffer.from(docArrayBuffer);
+      console.log('Document buffer size:', docBuffer.length);
       
       console.log('Calling Rekognition CompareFaces...');
       const compareResult = await rekognition.send(new CompareFacesCommand({
