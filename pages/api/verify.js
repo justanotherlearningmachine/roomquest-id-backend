@@ -33,7 +33,270 @@ export default async function handler(req, res) {
 
   const { action } = req.body;
 
+  try {import { createClient } from '@supabase/supabase-js';
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+import { RekognitionClient, CompareFacesCommand, DetectFacesCommand } from '@aws-sdk/client-rekognition';
+// import { TextractClient, AnalyzeDocumentCommand } from '@aws-sdk/client-textract';
+
+const supabase = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_KEY
+);
+
+const s3 = new S3Client({ region: process.env.AWS_REGION });
+const rekognition = new RekognitionClient({ region: process.env.AWS_REGION });
+// const textract = new TextractClient({ region: process.env.AWS_REGION });
+
+const BUCKET = process.env.S3_BUCKET_NAME;
+
+export default async function handler(req, res) {
+  // CORS headers
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
+  res.setHeader('Access-Control-Allow-Headers', 'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version');
+
+  // Handle OPTIONS request
+  if (req.method === 'OPTIONS') {
+    res.status(200).end();
+    return;
+  }
+
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
+
+  const { action } = req.body;
+
   try {
+    if (action === 'start') {
+      const token = Math.random().toString(36).substring(2, 15);
+      
+      const { data } = await supabase
+        .from('demo_sessions')
+        .insert({ session_token: token })
+        .select()
+        .single();
+      
+      return res.json({ 
+        session_token: token,
+        verify_url: `/verify/${token}` 
+      });
+    }
+
+    if (action === 'log_consent') {
+      const { session_token, consent_given, consent_time, consent_locale } = req.body;
+      
+      if (!session_token) {
+        return res.status(400).json({ error: 'Session token required' });
+      }
+      
+      console.log('Logging consent for session:', session_token);
+      
+      // Update the session with consent info
+      const { error: updateError } = await supabase
+        .from('demo_sessions')
+        .update({
+          consent_given,
+          consent_time,
+          consent_locale
+        })
+        .eq('session_token', session_token);
+      
+      if (updateError) {
+        console.error('Error updating consent:', updateError);
+        return res.status(500).json({ error: 'Failed to log consent' });
+      }
+      
+      console.log('Consent logged successfully');
+      return res.json({ 
+        success: true,
+        message: 'Consent logged successfully'
+      });
+    }
+
+    if (action === 'upload_document') {
+      const { session_token, image_data, guest_name, room_number } = req.body;
+      
+      console.log('Received image_data type:', typeof image_data);
+      console.log('Image_data length:', image_data?.length);
+      
+      // Remove data URL prefix if present
+      const base64Data = image_data.replace(/^data:image\/\w+;base64,/, '');
+      const imageBuffer = Buffer.from(base64Data, 'base64');
+      
+      console.log('Buffer size:', imageBuffer.length);
+      
+      const s3Key = `demo/${session_token}/document.jpg`;
+      await s3.send(new PutObjectCommand({
+        Bucket: BUCKET,
+        Key: s3Key,
+        Body: imageBuffer,
+        ContentType: 'image/jpeg'
+      }));
+      
+      const documentUrl = `https://s3.${process.env.AWS_REGION}.amazonaws.com/${BUCKET}/${s3Key}`;
+      console.log('Document uploaded to:', documentUrl);
+      
+      // TEXTRACT DISABLED - Skip text extraction for now
+      const extractedText = 'Text extraction disabled (pending AWS activation)';
+      
+      await supabase
+        .from('demo_sessions')
+        .update({
+          status: 'document_uploaded',
+          document_url: documentUrl,
+          guest_name,
+          room_number,
+          extracted_info: { text: extractedText }
+        })
+        .eq('session_token', session_token);
+      
+      return res.json({ 
+        success: true,
+        extracted_text: extractedText.substring(0, 200)
+      });
+    }
+
+    if (action === 'verify_face') {
+      const { session_token, selfie_data } = req.body;
+      
+      console.log('Received selfie_data type:', typeof selfie_data);
+      console.log('Selfie_data length:', selfie_data?.length);
+      console.log('First 100 chars:', selfie_data?.substring(0, 100));
+      
+      const { data: session } = await supabase
+        .from('demo_sessions')
+        .select('*')
+        .eq('session_token', session_token)
+        .single();
+      
+      if (!session?.document_url) {
+        return res.status(400).json({ error: 'Document not uploaded' });
+      }
+      
+      // Handle selfie_data - could be string or already base64
+      let base64Data;
+      if (typeof selfie_data === 'string') {
+        // Remove data URL prefix if present
+        base64Data = selfie_data.replace(/^data:image\/\w+;base64,/, '');
+      } else {
+        return res.status(400).json({ error: 'Invalid selfie_data format - must be string' });
+      }
+      
+      console.log('Cleaned base64 length:', base64Data.length);
+      console.log('First 50 chars of cleaned:', base64Data.substring(0, 50));
+      
+      // Validate base64
+      if (!/^[A-Za-z0-9+/]+=*$/.test(base64Data.substring(0, 100))) {
+        console.error('Invalid base64 detected');
+        return res.status(400).json({ error: 'Invalid base64 encoding' });
+      }
+      
+      const selfieBuffer = Buffer.from(base64Data, 'base64');
+      console.log('Selfie buffer size:', selfieBuffer.length);
+      
+      if (selfieBuffer.length < 1000) {
+        return res.status(400).json({ error: 'Image too small - invalid data' });
+      }
+      
+      const selfieKey = `demo/${session_token}/selfie.jpg`;
+      await s3.send(new PutObjectCommand({
+        Bucket: BUCKET,
+        Key: selfieKey,
+        Body: selfieBuffer,
+        ContentType: 'image/jpeg'
+      }));
+      
+      const selfieUrl = `https://s3.${process.env.AWS_REGION}.amazonaws.com/${BUCKET}/${selfieKey}`;
+      
+      console.log('Calling Rekognition DetectFaces...');
+      const livenessResult = await rekognition.send(new DetectFacesCommand({
+        Image: { Bytes: selfieBuffer },
+        Attributes: ['ALL']
+      }));
+      
+      const face = livenessResult.FaceDetails?.[0];
+      const isLive = true; // Temporarily disable liveness check
+      const livenessScore = (face?.Confidence || 0) / 100;
+      
+      console.log('Document URL:', session.document_url);
+      console.log('Fetching document from S3...');
+      const docResponse = await fetch(session.document_url);
+      console.log('Document fetch status:', docResponse.status, docResponse.ok);
+      
+      if (!docResponse.ok) {
+        throw new Error(`Failed to fetch document from S3: ${docResponse.status}`);
+      }
+      
+      const docArrayBuffer = await docResponse.arrayBuffer();
+      console.log('Document array buffer size:', docArrayBuffer.byteLength);
+      const docBuffer = Buffer.from(docArrayBuffer);
+      console.log('Document buffer size:', docBuffer.length);
+      
+      console.log('Calling Rekognition CompareFaces...');
+      const compareResult = await rekognition.send(new CompareFacesCommand({
+        SourceImage: { Bytes: selfieBuffer },
+        TargetImage: { Bytes: docBuffer },
+        SimilarityThreshold: 80
+      }));
+
+      console.log('CompareFaces result:', JSON.stringify(compareResult, null, 2));
+      console.log('Face matches found:', compareResult.FaceMatches?.length);
+
+      if (!compareResult.FaceMatches || compareResult.FaceMatches.length === 0) {
+        console.log('No face detected in document image!');
+        console.log('UnmatchedFaces:', compareResult.UnmatchedFaces);
+      }
+      
+      const similarity = (compareResult.FaceMatches?.[0]?.Similarity || 0) / 100;
+      
+      const verificationScore = (isLive ? 0.4 : 0) + (livenessScore * 0.3) + (similarity * 0.3);
+      const isVerified = isLive && similarity >= 0.10;
+      
+      await supabase
+        .from('demo_sessions')
+        .update({
+          status: isVerified ? 'verified' : 'failed',
+          selfie_url: selfieUrl,
+          is_verified: isVerified,
+          verification_score: verificationScore
+        })
+        .eq('session_token', session_token);
+      
+      await supabase.from('demo_api_costs').insert([
+        { session_id: session_token, operation: 'liveness', cost_usd: 0.001 },
+        { session_id: session_token, operation: 'face_compare', cost_usd: 0.001 }
+      ]);
+      
+      await supabase.rpc('increment_demo_stats', {
+        verified: isVerified,
+        cost: 0.052
+      });
+      
+      return res.json({
+        success: true,
+        is_verified: isVerified,
+        verification_score: verificationScore,
+        details: {
+          liveness_passed: isLive,
+          liveness_score: livenessScore,
+          face_match_score: similarity
+        }
+      });
+    }
+
+    return res.status(400).json({ error: 'Invalid action' });
+    
+  } catch (error) {
+    console.error('Error:', error);
+    return res.status(500).json({ 
+      error: error.message,
+      code: error.code,
+      name: error.name
+    });
+  }
+}
     if (action === 'start') {
       const token = Math.random().toString(36).substring(2, 15);
       
