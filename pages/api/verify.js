@@ -1,10 +1,6 @@
 import crypto from "crypto";
 import { createClient } from "@supabase/supabase-js";
-import {
-  S3Client,
-  PutObjectCommand,
-  GetObjectCommand,
-} from "@aws-sdk/client-s3";
+import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
 import {
   RekognitionClient,
   CompareFacesCommand,
@@ -26,21 +22,18 @@ const s3 = new S3Client({ region: AWS_REGION });
 const rekognition = new RekognitionClient({ region: AWS_REGION });
 
 function setCors(res) {
-  // If you want to lock this down later, replace '*' with your Lovable domain.
+  // For production harden: replace '*' with https://quest-id-flow.lovable.app
   res.setHeader("Access-Control-Allow-Credentials", "true");
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader(
-    "Access-Control-Allow-Methods",
-    "GET,OPTIONS,PATCH,DELETE,POST,PUT"
-  );
+  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS,POST");
   res.setHeader(
     "Access-Control-Allow-Headers",
-    "X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version"
+    "Content-Type, X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Date, X-Api-Version"
   );
 }
 
 function generateToken() {
-  // 12 chars, URL-safe-ish
+  // URL-safe session token
   return crypto.randomBytes(9).toString("base64url");
 }
 
@@ -58,12 +51,22 @@ function stripDataUrlPrefix(base64OrDataUrl) {
 }
 
 function inferStepFromSession(session) {
-  // If you add explicit step tracking later, this is your fallback inference.
+  if (!session) return "welcome";
+  if (session?.current_step) return session.current_step;
+
+  // Fallback inference if current_step wasn't stored
   if (session?.is_verified === true || session?.verification_score != null) return "results";
-  if (session?.selfie_url) return "results"; // already did selfie step
+  if (session?.selfie_url) return "results";
   if (session?.document_url) return "selfie";
   if (session?.guest_name || session?.room_number) return "document";
   return "welcome";
+}
+
+function parseS3Url(s3Url) {
+  // expects: s3://bucket/key
+  const match = String(s3Url || "").match(/^s3:\/\/([^/]+)\/(.+)$/);
+  if (!match) return null;
+  return { bucket: match[1], key: match[2] };
 }
 
 export default async function handler(req, res) {
@@ -74,7 +77,6 @@ export default async function handler(req, res) {
     return;
   }
 
-  // Keep POST-only for now to match your frontend
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" });
   }
@@ -95,13 +97,12 @@ export default async function handler(req, res) {
     if (action === "start") {
       const token = generateToken();
 
-      const { error } = await supabase
-        .from("demo_sessions")
-        .insert({
-          session_token: token,
-          status: "started",
-          current_step: "welcome",
-        });
+      const { error } = await supabase.from("demo_sessions").insert({
+        session_token: token,
+        status: "started",
+        current_step: "welcome",
+        updated_at: new Date().toISOString(),
+      });
 
       if (error) {
         console.error("Error creating session:", error);
@@ -115,12 +116,10 @@ export default async function handler(req, res) {
     }
 
     // ---------------------------
-    // ACTION: get_session (NEW)
-    // used for "resume after refresh"
+    // ACTION: get_session
     // ---------------------------
     if (action === "get_session") {
       const { session_token } = req.body || {};
-
       if (!session_token) {
         return res.status(400).json({ error: "Session token required" });
       }
@@ -141,6 +140,8 @@ export default async function handler(req, res) {
             "selfie_url",
             "is_verified",
             "verification_score",
+            "liveness_score",
+            "face_match_score",
             "extracted_info",
             "created_at",
             "updated_at",
@@ -153,12 +154,14 @@ export default async function handler(req, res) {
         return res.status(404).json({ error: "Session not found" });
       }
 
-      const current_step = session.current_step || inferStepFromSession(session);
+      const current_step = inferStepFromSession(session);
 
       return res.json({
         success: true,
         session: {
           session_token: session.session_token,
+          status: session.status ?? null,
+          current_step,
           consent_given: session.consent_given ?? null,
           consent_time: session.consent_time ?? null,
           consent_locale: session.consent_locale ?? null,
@@ -168,8 +171,8 @@ export default async function handler(req, res) {
           selfie_uploaded: Boolean(session.selfie_url),
           is_verified: session.is_verified ?? null,
           verification_score: session.verification_score ?? null,
-          current_step,
-          status: session.status ?? null,
+          liveness_score: session.liveness_score ?? null,
+          face_match_score: session.face_match_score ?? null,
         },
       });
     }
@@ -185,7 +188,6 @@ export default async function handler(req, res) {
         return res.status(400).json({ error: "Session token required" });
       }
 
-      // Ensure session exists
       const { data: existing, error: findError } = await supabase
         .from("demo_sessions")
         .select("session_token")
@@ -220,6 +222,39 @@ export default async function handler(req, res) {
     }
 
     // ---------------------------
+    // ACTION: update_guest (NEW)
+    // Step 1 persistence: lets refresh resume at Document step
+    // ---------------------------
+    if (action === "update_guest") {
+      const { session_token, guest_name, booking_ref, room_number } = req.body || {};
+
+      if (!session_token) {
+        return res.status(400).json({ error: "Session token required" });
+      }
+
+      // Accept either booking_ref or room_number (frontends vary)
+      const bookingValue = booking_ref || room_number || null;
+
+      const { error: updateError } = await supabase
+        .from("demo_sessions")
+        .update({
+          guest_name: guest_name || null,
+          room_number: bookingValue, // treat this as "booking ref" for now
+          status: "guest_info_saved",
+          current_step: "document",
+          updated_at: new Date().toISOString(),
+        })
+        .eq("session_token", session_token);
+
+      if (updateError) {
+        console.error("Error saving guest info:", updateError);
+        return res.status(500).json({ error: "Failed to save guest info" });
+      }
+
+      return res.json({ success: true });
+    }
+
+    // ---------------------------
     // ACTION: upload_document
     // ---------------------------
     if (action === "upload_document") {
@@ -251,10 +286,10 @@ export default async function handler(req, res) {
         })
       );
 
-      // Store a private S3 "pointer" (key) + keep URL for convenience if you want
+      // Store as private pointer
       const documentUrl = `s3://${BUCKET}/${s3Key}`;
 
-      // (Optional) placeholder until Textract is wired
+      // Placeholder until Textract is wired
       const extractedText = "Text extraction disabled (pending AWS activation)";
 
       const { error: updateError } = await supabase
@@ -328,7 +363,7 @@ export default async function handler(req, res) {
 
       const selfieUrl = `s3://${BUCKET}/${selfieKey}`;
 
-      // Liveness-ish heuristic (not true liveness, but your existing logic)
+      // Heuristic "liveness" (not true liveness)
       const livenessResult = await rekognition.send(
         new DetectFacesCommand({
           Image: { Bytes: selfieBuffer },
@@ -340,21 +375,16 @@ export default async function handler(req, res) {
       const isLive = Boolean(face?.EyesOpen?.Value) && (face?.Quality?.Brightness || 0) > 40;
       const livenessScore = (face?.Confidence || 0) / 100;
 
-      // Load the document from S3 using GetObject (works for private buckets)
-      // document_url stored as s3://bucket/key
-      const docUrl = String(session.document_url);
-      const match = docUrl.match(/^s3:\/\/([^/]+)\/(.+)$/);
-
-      if (!match) {
+      // Load the document from private S3
+      const parsed = parseS3Url(session.document_url);
+      if (!parsed) {
         return res.status(500).json({ error: "Invalid document_url format in session" });
       }
 
-      const [, docBucket, docKey] = match;
-
       const docObj = await s3.send(
         new GetObjectCommand({
-          Bucket: docBucket,
-          Key: docKey,
+          Bucket: parsed.bucket,
+          Key: parsed.key,
         })
       );
 
@@ -399,18 +429,26 @@ export default async function handler(req, res) {
         return res.status(500).json({ error: "Failed to save verification result" });
       }
 
-      // Optional: costs + stats (keep your existing behavior)
-      await supabase.from("demo_api_costs").insert([
-        { session_id: session_token, operation: "liveness", cost_usd: 0.001 },
-        { session_id: session_token, operation: "face_compare", cost_usd: 0.001 },
-      ]);
+      // Optional: costs + stats (safe to ignore failures, but keep behavior)
+      try {
+        await supabase.from("demo_api_costs").insert([
+          { session_id: session_token, operation: "liveness", cost_usd: 0.001 },
+          { session_id: session_token, operation: "face_compare", cost_usd: 0.001 },
+        ]);
+      } catch (e) {
+        console.warn("Cost insert failed (non-blocking):", e?.message || e);
+      }
 
-      await supabase.rpc("increment_demo_stats", {
-        verified: isVerified,
-        cost: 0.052,
-      });
+      try {
+        await supabase.rpc("increment_demo_stats", {
+          verified: isVerified,
+          cost: 0.052,
+        });
+      } catch (e) {
+        console.warn("increment_demo_stats failed (non-blocking):", e?.message || e);
+      }
 
-      // Frontend-friendly shape (matches your Vite client expectations)
+      // Frontend-friendly shape
       return res.json({
         success: true,
         is_verified: isVerified,
