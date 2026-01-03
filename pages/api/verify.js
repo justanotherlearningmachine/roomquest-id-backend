@@ -8,9 +8,14 @@ import {
 } from "@aws-sdk/client-rekognition";
 import { TextractClient, AnalyzeIDCommand } from "@aws-sdk/client-textract";
 
+/**
+ * =========================
+ * ENV
+ * =========================
+ */
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
-const AWS_REGION = process.env.AWS_REGION;
+const AWS_REGION = process.env.AWS_REGION; // should match S3 bucket region (you said ap-southeast-2)
 const BUCKET = process.env.S3_BUCKET_NAME;
 
 if (!SUPABASE_URL) console.warn("Missing env: NEXT_PUBLIC_SUPABASE_URL");
@@ -18,13 +23,23 @@ if (!SUPABASE_SERVICE_KEY) console.warn("Missing env: SUPABASE_SERVICE_KEY");
 if (!AWS_REGION) console.warn("Missing env: AWS_REGION");
 if (!BUCKET) console.warn("Missing env: S3_BUCKET_NAME");
 
+/**
+ * =========================
+ * CLIENTS
+ * =========================
+ */
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 const s3 = new S3Client({ region: AWS_REGION });
 const rekognition = new RekognitionClient({ region: AWS_REGION });
 const textract = new TextractClient({ region: AWS_REGION });
 
+/**
+ * =========================
+ * HELPERS
+ * =========================
+ */
 function setCors(res) {
-  // For production harden: replace '*' with https://quest-id-flow.lovable.app
+  // Production harden later: replace '*' with https://quest-id-flow.lovable.app
   res.setHeader("Access-Control-Allow-Credentials", "true");
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS,POST");
@@ -35,7 +50,6 @@ function setCors(res) {
 }
 
 function generateToken() {
-  // URL-safe session token
   return crypto.randomBytes(9).toString("base64url");
 }
 
@@ -47,16 +61,25 @@ async function streamToBuffer(readable) {
   return Buffer.concat(chunks);
 }
 
-function stripDataUrlPrefix(base64OrDataUrl) {
+/**
+ * Frontend sometimes sends:
+ * - raw base64 (no data URL prefix)
+ * - OR a full data URL ("data:image/jpeg;base64,...")
+ * This accepts both and returns raw base64 string.
+ */
+function normalizeBase64(base64OrDataUrl) {
   if (typeof base64OrDataUrl !== "string") return null;
-  return base64OrDataUrl.replace(/^data:image\/\w+;base64,/, "");
+  if (base64OrDataUrl.startsWith("data:image/")) {
+    return base64OrDataUrl.replace(/^data:image\/\w+;base64,/, "");
+  }
+  // assume already raw base64
+  return base64OrDataUrl;
 }
 
 function inferStepFromSession(session) {
   if (!session) return "welcome";
   if (session?.current_step) return session.current_step;
 
-  // Fallback inference if current_step wasn't stored
   if (session?.is_verified === true || session?.verification_score != null) return "results";
   if (session?.selfie_url) return "results";
   if (session?.document_url) return "selfie";
@@ -65,7 +88,6 @@ function inferStepFromSession(session) {
 }
 
 function parseS3Url(s3Url) {
-  // expects: s3://bucket/key
   const match = String(s3Url || "").match(/^s3:\/\/([^/]+)\/(.+)$/);
   if (!match) return null;
   return { bucket: match[1], key: match[2] };
@@ -76,6 +98,7 @@ function normalizeKey(k = "") {
 }
 
 function parseAnalyzeIdFields(fields = []) {
+  // Textract AnalyzeID returns a list of (Type.Text, ValueDetection.Text)
   const raw = {};
   for (const f of fields) {
     const key = normalizeKey(f?.Type?.Text);
@@ -83,19 +106,24 @@ function parseAnalyzeIdFields(fields = []) {
     if (key && val) raw[key] = val;
   }
 
-  // Best-effort normalization (fields vary by document type/country)
-  const fullName =
-    raw.name ||
+  // Common fields across passports/IDs vary:
+  // - NAME / FULL_NAME / GIVEN_NAME / SURNAME
+  // - DATE_OF_BIRTH / DOB
+  // - NATIONALITY / COUNTRY
+  // - DOCUMENT_NUMBER / PASSPORT_NUMBER / ID_NUMBER
+  const given = raw.given_name || raw.firstname || raw.first_name || null;
+  const sur = raw.surname || raw.lastname || raw.last_name || null;
+
+  const full_name =
     raw.full_name ||
-    raw.given_name && raw.surname
-      ? [raw.given_name, raw.surname].filter(Boolean).join(" ")
-      : null;
+    raw.name ||
+    (given || sur ? [given, sur].filter(Boolean).join(" ") : null) ||
+    null;
 
   const dob = raw.date_of_birth || raw.dob || null;
   const nationality = raw.nationality || raw.country || null;
 
-  // Document number can show up under multiple names
-  const documentNumber =
+  const document_number =
     raw.document_number ||
     raw.passport_number ||
     raw.id_number ||
@@ -104,34 +132,53 @@ function parseAnalyzeIdFields(fields = []) {
     null;
 
   return {
-    full_name: fullName || null,
+    full_name,
     nationality,
     dob,
-    document_number: documentNumber,
+    document_number,
     raw,
   };
 }
 
-async function runTextractAnalyzeIdNonBlocking(imageBuffer) {
-  // Non-blocking helper: returns { ok, data?, error? }
-  try {
+/**
+ * Non-blocking-ish Textract:
+ * - We try it, but cap the time we’re willing to wait (timeoutMs).
+ * - If it times out or fails, we proceed with the flow anyway.
+ *
+ * NOTE: AWS Textract AnalyzeID is supported in many regions, but not all.
+ * Since you're in ap-southeast-2, this should be okay IF your account + region supports it.
+ */
+async function runTextractAnalyzeIdWithTimeout(imageBuffer, timeoutMs = 1500) {
+  const run = async () => {
     const res = await textract.send(
       new AnalyzeIDCommand({
         DocumentPages: [{ Bytes: imageBuffer }],
       })
     );
 
-    const fields =
-      res?.IdentityDocuments?.[0]?.IdentityDocumentFields || [];
+    const fields = res?.IdentityDocuments?.[0]?.IdentityDocumentFields || [];
+    return parseAnalyzeIdFields(fields);
+  };
 
-    const parsed = parseAnalyzeIdFields(fields);
+  try {
+    const data = await Promise.race([
+      run(),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(`Textract timeout after ${timeoutMs}ms`)), timeoutMs)
+      ),
+    ]);
 
-    return { ok: true, data: parsed };
+    return { ok: true, data };
   } catch (e) {
     return { ok: false, error: e?.message || String(e) };
   }
 }
 
+/**
+ * =========================
+ * HANDLER
+ * =========================
+ */
 export default async function handler(req, res) {
   setCors(res);
 
@@ -154,9 +201,11 @@ export default async function handler(req, res) {
       });
     }
 
-    // ---------------------------
-    // ACTION: start
-    // ---------------------------
+    /**
+     * =========================
+     * ACTION: start
+     * =========================
+     */
     if (action === "start") {
       const token = generateToken();
 
@@ -178,9 +227,11 @@ export default async function handler(req, res) {
       });
     }
 
-    // ---------------------------
-    // ACTION: get_session
-    // ---------------------------
+    /**
+     * =========================
+     * ACTION: get_session
+     * =========================
+     */
     if (action === "get_session") {
       const { session_token } = req.body || {};
       if (!session_token) {
@@ -236,16 +287,18 @@ export default async function handler(req, res) {
           verification_score: session.verification_score ?? null,
           liveness_score: session.liveness_score ?? null,
           face_match_score: session.face_match_score ?? null,
+          extracted_info: session.extracted_info ?? null,
         },
       });
     }
 
-    // ---------------------------
-    // ACTION: log_consent
-    // ---------------------------
+    /**
+     * =========================
+     * ACTION: log_consent
+     * =========================
+     */
     if (action === "log_consent") {
-      const { session_token, consent_given, consent_time, consent_locale } =
-        req.body || {};
+      const { session_token, consent_given, consent_time, consent_locale } = req.body || {};
 
       if (!session_token) {
         return res.status(400).json({ error: "Session token required" });
@@ -268,6 +321,7 @@ export default async function handler(req, res) {
           consent_time: consent_time || new Date().toISOString(),
           consent_locale: consent_locale || "en",
           status: "consent_logged",
+          // keep step welcome here; front-end will move to step 1 (welcome) after consent anyway
           current_step: "welcome",
           updated_at: new Date().toISOString(),
         })
@@ -284,10 +338,12 @@ export default async function handler(req, res) {
       });
     }
 
-    // ---------------------------
-    // ACTION: update_guest (NEW)
-    // Step 1 persistence: lets refresh resume at Document step
-    // ---------------------------
+    /**
+     * =========================
+     * ACTION: update_guest (NEW)
+     * Persist Step 1 (so refresh resumes at Document step)
+     * =========================
+     */
     if (action === "update_guest") {
       const { session_token, guest_name, booking_ref, room_number } = req.body || {};
 
@@ -295,14 +351,14 @@ export default async function handler(req, res) {
         return res.status(400).json({ error: "Session token required" });
       }
 
-      // Accept either booking_ref or room_number (frontends vary)
+      // "room_number" is being used as booking ref in your current UI sometimes.
       const bookingValue = booking_ref || room_number || null;
 
       const { error: updateError } = await supabase
         .from("demo_sessions")
         .update({
           guest_name: guest_name || null,
-          room_number: bookingValue, // treat this as "booking ref" for now
+          room_number: bookingValue,
           status: "guest_info_saved",
           current_step: "document",
           updated_at: new Date().toISOString(),
@@ -317,9 +373,11 @@ export default async function handler(req, res) {
       return res.json({ success: true });
     }
 
-    // ---------------------------
-    // ACTION: upload_document
-    // ---------------------------
+    /**
+     * =========================
+     * ACTION: upload_document
+     * =========================
+     */
     if (action === "upload_document") {
       const { session_token, image_data, guest_name, room_number } = req.body || {};
 
@@ -330,7 +388,7 @@ export default async function handler(req, res) {
         return res.status(500).json({ error: "Server misconfigured: missing AWS env vars" });
       }
 
-      const base64Data = stripDataUrlPrefix(image_data);
+      const base64Data = normalizeBase64(image_data);
       if (!base64Data) return res.status(400).json({ error: "Invalid image_data format" });
 
       const imageBuffer = Buffer.from(base64Data, "base64");
@@ -349,30 +407,31 @@ export default async function handler(req, res) {
         })
       );
 
-      // Store as private pointer
       const documentUrl = `s3://${BUCKET}/${s3Key}`;
 
-      // ---- Textract (AnalyzeID) - BACKEND ONLY, NON-BLOCKING ----
-      // If Textract fails, we still proceed with the flow.
-      const textractResult = await runTextractAnalyzeIdNonBlocking(imageBuffer);
+      /**
+       * Textract (AnalyzeID) - backend only.
+       * We TRY quickly (timeout) so we don’t add friction.
+       * If it fails/times out: proceed anyway.
+       */
+      const textractResult = await runTextractAnalyzeIdWithTimeout(imageBuffer, 1500);
 
-      // Keep a friendly message for compatibility with your existing frontend.
-      // (Frontend doesn't need to display this; it's just here if you want.)
       let extractedText = "Text extraction unavailable";
       let extractedStructured = null;
 
       if (textractResult.ok) {
         extractedStructured = textractResult.data;
-        extractedText = [
-          extractedStructured.full_name ? `Name: ${extractedStructured.full_name}` : null,
-          extractedStructured.nationality ? `Nationality: ${extractedStructured.nationality}` : null,
-          extractedStructured.dob ? `DOB: ${extractedStructured.dob}` : null,
-          extractedStructured.document_number ? `Doc#: ${extractedStructured.document_number}` : null,
-        ]
-          .filter(Boolean)
-          .join(" | ") || "Textract extracted fields (see extracted_info.textract)";
+        extractedText =
+          [
+            extractedStructured.full_name ? `Name: ${extractedStructured.full_name}` : null,
+            extractedStructured.nationality ? `Nationality: ${extractedStructured.nationality}` : null,
+            extractedStructured.dob ? `DOB: ${extractedStructured.dob}` : null,
+            extractedStructured.document_number ? `Doc#: ${extractedStructured.document_number}` : null,
+          ]
+            .filter(Boolean)
+            .join(" | ") || "Textract extracted fields (see extracted_info.textract)";
       } else {
-        extractedText = "Textract failed (non-blocking)";
+        extractedText = "Textract unavailable (non-blocking)";
         console.warn("Textract AnalyzeID failed (non-blocking):", textractResult.error);
       }
 
@@ -402,16 +461,17 @@ export default async function handler(req, res) {
       return res.json({
         success: true,
         extracted_text: extractedText.substring(0, 200),
-        // Optional: include structured data (frontend can ignore)
         data: extractedStructured
           ? { extracted_text: extractedText, extracted_fields: extractedStructured }
           : { extracted_text: extractedText },
       });
     }
 
-    // ---------------------------
-    // ACTION: verify_face
-    // ---------------------------
+    /**
+     * =========================
+     * ACTION: verify_face
+     * =========================
+     */
     if (action === "verify_face") {
       const { session_token, selfie_data } = req.body || {};
 
@@ -436,7 +496,7 @@ export default async function handler(req, res) {
         return res.status(400).json({ error: "Document not uploaded" });
       }
 
-      const selfieBase64 = stripDataUrlPrefix(selfie_data);
+      const selfieBase64 = normalizeBase64(selfie_data);
       if (!selfieBase64) return res.status(400).json({ error: "Invalid selfie_data format" });
 
       const selfieBuffer = Buffer.from(selfieBase64, "base64");
@@ -501,6 +561,7 @@ export default async function handler(req, res) {
       const verificationScore =
         (isLive ? 0.4 : 0) + livenessScore * 0.3 + similarity * 0.3;
 
+      // your earlier code used 0.65 — keep it
       const isVerified = isLive && similarity >= 0.65;
 
       const { error: updateError } = await supabase
@@ -522,7 +583,7 @@ export default async function handler(req, res) {
         return res.status(500).json({ error: "Failed to save verification result" });
       }
 
-      // Optional: costs + stats (safe to ignore failures, but keep behavior)
+      // Optional: costs + stats (non-blocking)
       try {
         await supabase.from("demo_api_costs").insert([
           { session_id: session_token, operation: "liveness", cost_usd: 0.001 },
@@ -541,7 +602,6 @@ export default async function handler(req, res) {
         console.warn("increment_demo_stats failed (non-blocking):", e?.message || e);
       }
 
-      // Frontend-friendly shape
       return res.json({
         success: true,
         is_verified: isVerified,
