@@ -6,6 +6,7 @@ import {
   CompareFacesCommand,
   DetectFacesCommand,
 } from "@aws-sdk/client-rekognition";
+import { TextractClient, AnalyzeIDCommand } from "@aws-sdk/client-textract";
 
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
@@ -20,6 +21,7 @@ if (!BUCKET) console.warn("Missing env: S3_BUCKET_NAME");
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 const s3 = new S3Client({ region: AWS_REGION });
 const rekognition = new RekognitionClient({ region: AWS_REGION });
+const textract = new TextractClient({ region: AWS_REGION });
 
 function setCors(res) {
   // For production harden: replace '*' with https://quest-id-flow.lovable.app
@@ -67,6 +69,67 @@ function parseS3Url(s3Url) {
   const match = String(s3Url || "").match(/^s3:\/\/([^/]+)\/(.+)$/);
   if (!match) return null;
   return { bucket: match[1], key: match[2] };
+}
+
+function normalizeKey(k = "") {
+  return String(k).trim().toLowerCase().replace(/\s+/g, "_");
+}
+
+function parseAnalyzeIdFields(fields = []) {
+  const raw = {};
+  for (const f of fields) {
+    const key = normalizeKey(f?.Type?.Text);
+    const val = f?.ValueDetection?.Text;
+    if (key && val) raw[key] = val;
+  }
+
+  // Best-effort normalization (fields vary by document type/country)
+  const fullName =
+    raw.name ||
+    raw.full_name ||
+    raw.given_name && raw.surname
+      ? [raw.given_name, raw.surname].filter(Boolean).join(" ")
+      : null;
+
+  const dob = raw.date_of_birth || raw.dob || null;
+  const nationality = raw.nationality || raw.country || null;
+
+  // Document number can show up under multiple names
+  const documentNumber =
+    raw.document_number ||
+    raw.passport_number ||
+    raw.id_number ||
+    raw.identity_document_number ||
+    raw.personal_number ||
+    null;
+
+  return {
+    full_name: fullName || null,
+    nationality,
+    dob,
+    document_number: documentNumber,
+    raw,
+  };
+}
+
+async function runTextractAnalyzeIdNonBlocking(imageBuffer) {
+  // Non-blocking helper: returns { ok, data?, error? }
+  try {
+    const res = await textract.send(
+      new AnalyzeIDCommand({
+        DocumentPages: [{ Bytes: imageBuffer }],
+      })
+    );
+
+    const fields =
+      res?.IdentityDocuments?.[0]?.IdentityDocumentFields || [];
+
+    const parsed = parseAnalyzeIdFields(fields);
+
+    return { ok: true, data: parsed };
+  } catch (e) {
+    return { ok: false, error: e?.message || String(e) };
+  }
 }
 
 export default async function handler(req, res) {
@@ -289,8 +352,29 @@ export default async function handler(req, res) {
       // Store as private pointer
       const documentUrl = `s3://${BUCKET}/${s3Key}`;
 
-      // Placeholder until Textract is wired
-      const extractedText = "Text extraction disabled (pending AWS activation)";
+      // ---- Textract (AnalyzeID) - BACKEND ONLY, NON-BLOCKING ----
+      // If Textract fails, we still proceed with the flow.
+      const textractResult = await runTextractAnalyzeIdNonBlocking(imageBuffer);
+
+      // Keep a friendly message for compatibility with your existing frontend.
+      // (Frontend doesn't need to display this; it's just here if you want.)
+      let extractedText = "Text extraction unavailable";
+      let extractedStructured = null;
+
+      if (textractResult.ok) {
+        extractedStructured = textractResult.data;
+        extractedText = [
+          extractedStructured.full_name ? `Name: ${extractedStructured.full_name}` : null,
+          extractedStructured.nationality ? `Nationality: ${extractedStructured.nationality}` : null,
+          extractedStructured.dob ? `DOB: ${extractedStructured.dob}` : null,
+          extractedStructured.document_number ? `Doc#: ${extractedStructured.document_number}` : null,
+        ]
+          .filter(Boolean)
+          .join(" | ") || "Textract extracted fields (see extracted_info.textract)";
+      } else {
+        extractedText = "Textract failed (non-blocking)";
+        console.warn("Textract AnalyzeID failed (non-blocking):", textractResult.error);
+      }
 
       const { error: updateError } = await supabase
         .from("demo_sessions")
@@ -300,7 +384,12 @@ export default async function handler(req, res) {
           document_url: documentUrl,
           guest_name: guest_name || null,
           room_number: room_number || null,
-          extracted_info: { text: extractedText },
+          extracted_info: {
+            text: extractedText,
+            textract: extractedStructured,
+            textract_ok: textractResult.ok,
+            textract_error: textractResult.ok ? null : textractResult.error,
+          },
           updated_at: new Date().toISOString(),
         })
         .eq("session_token", session_token);
@@ -313,6 +402,10 @@ export default async function handler(req, res) {
       return res.json({
         success: true,
         extracted_text: extractedText.substring(0, 200),
+        // Optional: include structured data (frontend can ignore)
+        data: extractedStructured
+          ? { extracted_text: extractedText, extracted_fields: extractedStructured }
+          : { extracted_text: extractedText },
       });
     }
 
