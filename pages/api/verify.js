@@ -501,7 +501,7 @@ export default async function handler(req, res) {
       const verificationScore =
         (isLive ? 0.4 : 0) + livenessScore * 0.3 + similarity * 0.3;
 
-      const isVerified = isLive && similarity >= 0.75;
+      const isVerified = isLive && similarity >= 0.65;
 
       const { error: updateError } = await supabase
         .from("demo_sessions")
