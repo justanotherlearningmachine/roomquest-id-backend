@@ -1,6 +1,10 @@
 import crypto from "crypto";
 import { createClient } from "@supabase/supabase-js";
-import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import {
+  S3Client,
+  PutObjectCommand,
+  GetObjectCommand,
+} from "@aws-sdk/client-s3";
 import {
   RekognitionClient,
   CompareFacesCommand,
@@ -15,7 +19,7 @@ import { TextractClient, AnalyzeIDCommand } from "@aws-sdk/client-textract";
  */
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
-const AWS_REGION = process.env.AWS_REGION; // should match S3 bucket region (you said ap-southeast-2)
+const AWS_REGION = process.env.AWS_REGION; // should match S3 bucket region (ap-southeast-2)
 const BUCKET = process.env.S3_BUCKET_NAME;
 
 if (!SUPABASE_URL) console.warn("Missing env: NEXT_PUBLIC_SUPABASE_URL");
@@ -62,17 +66,15 @@ async function streamToBuffer(readable) {
 }
 
 /**
- * Frontend sometimes sends:
- * - raw base64 (no data URL prefix)
- * - OR a full data URL ("data:image/jpeg;base64,...")
- * This accepts both and returns raw base64 string.
+ * Accepts either:
+ * - raw base64
+ * - data URL ("data:image/jpeg;base64,...")
  */
 function normalizeBase64(base64OrDataUrl) {
   if (typeof base64OrDataUrl !== "string") return null;
   if (base64OrDataUrl.startsWith("data:image/")) {
     return base64OrDataUrl.replace(/^data:image\/\w+;base64,/, "");
   }
-  // assume already raw base64
   return base64OrDataUrl;
 }
 
@@ -80,7 +82,8 @@ function inferStepFromSession(session) {
   if (!session) return "welcome";
   if (session?.current_step) return session.current_step;
 
-  if (session?.is_verified === true || session?.verification_score != null) return "results";
+  if (session?.is_verified === true || session?.verification_score != null)
+    return "results";
   if (session?.selfie_url) return "results";
   if (session?.document_url) return "selfie";
   if (session?.guest_name || session?.room_number) return "document";
@@ -98,7 +101,6 @@ function normalizeKey(k = "") {
 }
 
 function parseAnalyzeIdFields(fields = []) {
-  // Textract AnalyzeID returns a list of (Type.Text, ValueDetection.Text)
   const raw = {};
   for (const f of fields) {
     const key = normalizeKey(f?.Type?.Text);
@@ -106,11 +108,6 @@ function parseAnalyzeIdFields(fields = []) {
     if (key && val) raw[key] = val;
   }
 
-  // Common fields across passports/IDs vary:
-  // - NAME / FULL_NAME / GIVEN_NAME / SURNAME
-  // - DATE_OF_BIRTH / DOB
-  // - NATIONALITY / COUNTRY
-  // - DOCUMENT_NUMBER / PASSPORT_NUMBER / ID_NUMBER
   const given = raw.given_name || raw.firstname || raw.first_name || null;
   const sur = raw.surname || raw.lastname || raw.last_name || null;
 
@@ -141,12 +138,7 @@ function parseAnalyzeIdFields(fields = []) {
 }
 
 /**
- * Non-blocking-ish Textract:
- * - We try it, but cap the time we’re willing to wait (timeoutMs).
- * - If it times out or fails, we proceed with the flow anyway.
- *
- * NOTE: AWS Textract AnalyzeID is supported in many regions, but not all.
- * Since you're in ap-southeast-2, this should be okay IF your account + region supports it.
+ * Non-blocking-ish Textract with timeout.
  */
 async function runTextractAnalyzeIdWithTimeout(imageBuffer, timeoutMs = 1500) {
   const run = async () => {
@@ -155,7 +147,6 @@ async function runTextractAnalyzeIdWithTimeout(imageBuffer, timeoutMs = 1500) {
         DocumentPages: [{ Bytes: imageBuffer }],
       })
     );
-
     const fields = res?.IdentityDocuments?.[0]?.IdentityDocumentFields || [];
     return parseAnalyzeIdFields(fields);
   };
@@ -164,14 +155,29 @@ async function runTextractAnalyzeIdWithTimeout(imageBuffer, timeoutMs = 1500) {
     const data = await Promise.race([
       run(),
       new Promise((_, reject) =>
-        setTimeout(() => reject(new Error(`Textract timeout after ${timeoutMs}ms`)), timeoutMs)
+        setTimeout(
+          () => reject(new Error(`Textract timeout after ${timeoutMs}ms`)),
+          timeoutMs
+        )
       ),
     ]);
-
     return { ok: true, data };
   } catch (e) {
     return { ok: false, error: e?.message || String(e) };
   }
+}
+
+function toIntOrNull(v) {
+  if (v === null || v === undefined) return null;
+  const n = Number(v);
+  if (!Number.isFinite(n)) return null;
+  return Math.trunc(n);
+}
+
+function clampInt(n, min, max) {
+  const x = toIntOrNull(n);
+  if (x === null) return min;
+  return Math.min(Math.max(x, min), max);
 }
 
 /**
@@ -194,25 +200,33 @@ export default async function handler(req, res) {
   const { action } = req.body || {};
 
   try {
-    // Basic env sanity check
     if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
-      return res.status(500).json({
-        error: "Server misconfigured: missing Supabase env vars",
-      });
+      return res
+        .status(500)
+        .json({ error: "Server misconfigured: missing Supabase env vars" });
     }
 
     /**
      * =========================
      * ACTION: start
+     * - initialize expected/verified counts
      * =========================
      */
     if (action === "start") {
       const token = generateToken();
 
+      // Default: 1 guest expected until Cloudbeds provides actual count.
+      const expected_guest_count = 1;
+      const verified_guest_count = 0;
+      const requires_additional_guest = expected_guest_count > verified_guest_count;
+
       const { error } = await supabase.from("demo_sessions").insert({
         session_token: token,
         status: "started",
         current_step: "welcome",
+        expected_guest_count,
+        verified_guest_count,
+        requires_additional_guest,
         updated_at: new Date().toISOString(),
       });
 
@@ -257,6 +271,9 @@ export default async function handler(req, res) {
             "liveness_score",
             "face_match_score",
             "extracted_info",
+            "expected_guest_count",
+            "verified_guest_count",
+            "requires_additional_guest",
             "created_at",
             "updated_at",
           ].join(",")
@@ -270,24 +287,45 @@ export default async function handler(req, res) {
 
       const current_step = inferStepFromSession(session);
 
+      const expected = clampInt(session.expected_guest_count, 1, 10);
+      const verified = clampInt(session.verified_guest_count, 0, 10);
+
+      // If DB has null, compute safely
+      const requires =
+        session.requires_additional_guest === true
+          ? true
+          : session.requires_additional_guest === false
+          ? false
+          : verified < expected;
+
       return res.json({
         success: true,
         session: {
           session_token: session.session_token,
           status: session.status ?? null,
           current_step,
+
           consent_given: session.consent_given ?? null,
           consent_time: session.consent_time ?? null,
           consent_locale: session.consent_locale ?? null,
+
           guest_name: session.guest_name ?? null,
           room_number: session.room_number ?? null,
+
           document_uploaded: Boolean(session.document_url),
           selfie_uploaded: Boolean(session.selfie_url),
+
           is_verified: session.is_verified ?? null,
           verification_score: session.verification_score ?? null,
           liveness_score: session.liveness_score ?? null,
           face_match_score: session.face_match_score ?? null,
+
           extracted_info: session.extracted_info ?? null,
+
+          expected_guest_count: expected,
+          verified_guest_count: verified,
+          requires_additional_guest: requires,
+          remaining_guest_verifications: Math.max(expected - verified, 0),
         },
       });
     }
@@ -298,7 +336,8 @@ export default async function handler(req, res) {
      * =========================
      */
     if (action === "log_consent") {
-      const { session_token, consent_given, consent_time, consent_locale } = req.body || {};
+      const { session_token, consent_given, consent_time, consent_locale } =
+        req.body || {};
 
       if (!session_token) {
         return res.status(400).json({ error: "Session token required" });
@@ -321,7 +360,6 @@ export default async function handler(req, res) {
           consent_time: consent_time || new Date().toISOString(),
           consent_locale: consent_locale || "en",
           status: "consent_logged",
-          // keep step welcome here; front-end will move to step 1 (welcome) after consent anyway
           current_step: "welcome",
           updated_at: new Date().toISOString(),
         })
@@ -332,37 +370,63 @@ export default async function handler(req, res) {
         return res.status(500).json({ error: "Failed to log consent" });
       }
 
-      return res.json({
-        success: true,
-        message: "Consent logged successfully",
-      });
+      return res.json({ success: true, message: "Consent logged successfully" });
     }
 
     /**
      * =========================
-     * ACTION: update_guest (NEW)
-     * Persist Step 1 (so refresh resumes at Document step)
+     * ACTION: update_guest
+     * - Persist Step 1 so refresh resumes at Document step
+     * - Optional: allow caller to set expected_guest_count now (for testing)
      * =========================
      */
     if (action === "update_guest") {
-      const { session_token, guest_name, booking_ref, room_number } = req.body || {};
+      const {
+        session_token,
+        guest_name,
+        booking_ref,
+        room_number,
+        expected_guest_count,
+      } = req.body || {};
 
       if (!session_token) {
         return res.status(400).json({ error: "Session token required" });
       }
 
-      // "room_number" is being used as booking ref in your current UI sometimes.
       const bookingValue = booking_ref || room_number || null;
+
+      // Optional override for testing (defaults unchanged if omitted)
+      const expectedOverride = toIntOrNull(expected_guest_count);
+      const expectedToSet =
+        expectedOverride === null ? undefined : clampInt(expectedOverride, 1, 10);
+
+      const updatePayload = {
+        guest_name: guest_name || null,
+        room_number: bookingValue,
+        status: "guest_info_saved",
+        current_step: "document",
+        updated_at: new Date().toISOString(),
+      };
+
+      if (expectedToSet !== undefined) {
+        updatePayload.expected_guest_count = expectedToSet;
+        // do not change verified count here; only in verify_face success
+        // but do update requires flag based on current verified
+        const { data: s, error: sErr } = await supabase
+          .from("demo_sessions")
+          .select("verified_guest_count")
+          .eq("session_token", session_token)
+          .single();
+
+        if (!sErr && s) {
+          const verified = clampInt(s.verified_guest_count, 0, 10);
+          updatePayload.requires_additional_guest = verified < expectedToSet;
+        }
+      }
 
       const { error: updateError } = await supabase
         .from("demo_sessions")
-        .update({
-          guest_name: guest_name || null,
-          room_number: bookingValue,
-          status: "guest_info_saved",
-          current_step: "document",
-          updated_at: new Date().toISOString(),
-        })
+        .update(updatePayload)
         .eq("session_token", session_token);
 
       if (updateError) {
@@ -376,20 +440,27 @@ export default async function handler(req, res) {
     /**
      * =========================
      * ACTION: upload_document
+     * - uploads to S3
+     * - runs Textract non-blocking (backend only)
      * =========================
      */
     if (action === "upload_document") {
       const { session_token, image_data, guest_name, room_number } = req.body || {};
 
-      if (!session_token) return res.status(400).json({ error: "Session token required" });
-      if (!image_data) return res.status(400).json({ error: "image_data required" });
+      if (!session_token)
+        return res.status(400).json({ error: "Session token required" });
+      if (!image_data)
+        return res.status(400).json({ error: "image_data required" });
 
       if (!AWS_REGION || !BUCKET) {
-        return res.status(500).json({ error: "Server misconfigured: missing AWS env vars" });
+        return res
+          .status(500)
+          .json({ error: "Server misconfigured: missing AWS env vars" });
       }
 
       const base64Data = normalizeBase64(image_data);
-      if (!base64Data) return res.status(400).json({ error: "Invalid image_data format" });
+      if (!base64Data)
+        return res.status(400).json({ error: "Invalid image_data format" });
 
       const imageBuffer = Buffer.from(base64Data, "base64");
       if (imageBuffer.length < 1000) {
@@ -409,12 +480,10 @@ export default async function handler(req, res) {
 
       const documentUrl = `s3://${BUCKET}/${s3Key}`;
 
-      /**
-       * Textract (AnalyzeID) - backend only.
-       * We TRY quickly (timeout) so we don’t add friction.
-       * If it fails/times out: proceed anyway.
-       */
-      const textractResult = await runTextractAnalyzeIdWithTimeout(imageBuffer, 1500);
+      const textractResult = await runTextractAnalyzeIdWithTimeout(
+        imageBuffer,
+        1500
+      );
 
       let extractedText = "Text extraction unavailable";
       let extractedStructured = null;
@@ -423,16 +492,26 @@ export default async function handler(req, res) {
         extractedStructured = textractResult.data;
         extractedText =
           [
-            extractedStructured.full_name ? `Name: ${extractedStructured.full_name}` : null,
-            extractedStructured.nationality ? `Nationality: ${extractedStructured.nationality}` : null,
+            extractedStructured.full_name
+              ? `Name: ${extractedStructured.full_name}`
+              : null,
+            extractedStructured.nationality
+              ? `Nationality: ${extractedStructured.nationality}`
+              : null,
             extractedStructured.dob ? `DOB: ${extractedStructured.dob}` : null,
-            extractedStructured.document_number ? `Doc#: ${extractedStructured.document_number}` : null,
+            extractedStructured.document_number
+              ? `Doc#: ${extractedStructured.document_number}`
+              : null,
           ]
             .filter(Boolean)
-            .join(" | ") || "Textract extracted fields (see extracted_info.textract)";
+            .join(" | ") ||
+          "Textract extracted fields (see extracted_info.textract)";
       } else {
         extractedText = "Textract unavailable (non-blocking)";
-        console.warn("Textract AnalyzeID failed (non-blocking):", textractResult.error);
+        console.warn(
+          "Textract AnalyzeID failed (non-blocking):",
+          textractResult.error
+        );
       }
 
       const { error: updateError } = await supabase
@@ -470,16 +549,23 @@ export default async function handler(req, res) {
     /**
      * =========================
      * ACTION: verify_face
+     * - if verification succeeds, increment verified_guest_count
+     * - compute requires_additional_guest
+     * - return signal to frontend (no new UI step required)
      * =========================
      */
     if (action === "verify_face") {
       const { session_token, selfie_data } = req.body || {};
 
-      if (!session_token) return res.status(400).json({ error: "Session token required" });
-      if (!selfie_data) return res.status(400).json({ error: "selfie_data required" });
+      if (!session_token)
+        return res.status(400).json({ error: "Session token required" });
+      if (!selfie_data)
+        return res.status(400).json({ error: "selfie_data required" });
 
       if (!AWS_REGION || !BUCKET) {
-        return res.status(500).json({ error: "Server misconfigured: missing AWS env vars" });
+        return res
+          .status(500)
+          .json({ error: "Server misconfigured: missing AWS env vars" });
       }
 
       const { data: session, error: sessionError } = await supabase
@@ -497,14 +583,21 @@ export default async function handler(req, res) {
       }
 
       const selfieBase64 = normalizeBase64(selfie_data);
-      if (!selfieBase64) return res.status(400).json({ error: "Invalid selfie_data format" });
+      if (!selfieBase64)
+        return res.status(400).json({ error: "Invalid selfie_data format" });
 
       const selfieBuffer = Buffer.from(selfieBase64, "base64");
       if (selfieBuffer.length < 1000) {
         return res.status(400).json({ error: "Image too small" });
       }
 
-      const selfieKey = `demo/${session_token}/selfie.jpg`;
+      const expected = clampInt(session.expected_guest_count, 1, 10);
+      const verifiedBefore = clampInt(session.verified_guest_count, 0, 10);
+
+      // Save each selfie separately so multiple guests don't overwrite.
+      const selfieIndex = Math.min(verifiedBefore + 1, 10);
+      const selfieKey = `demo/${session_token}/selfie_${selfieIndex}.jpg`;
+
       await s3.send(
         new PutObjectCommand({
           Bucket: BUCKET,
@@ -516,7 +609,7 @@ export default async function handler(req, res) {
 
       const selfieUrl = `s3://${BUCKET}/${selfieKey}`;
 
-      // Heuristic "liveness" (not true liveness)
+      // Liveness-ish heuristic (not true liveness)
       const livenessResult = await rekognition.send(
         new DetectFacesCommand({
           Image: { Bytes: selfieBuffer },
@@ -525,13 +618,17 @@ export default async function handler(req, res) {
       );
 
       const face = livenessResult.FaceDetails?.[0];
-      const isLive = Boolean(face?.EyesOpen?.Value) && (face?.Quality?.Brightness || 0) > 40;
+      const isLive =
+        Boolean(face?.EyesOpen?.Value) &&
+        (face?.Quality?.Brightness || 0) > 40;
       const livenessScore = (face?.Confidence || 0) / 100;
 
-      // Load the document from private S3
+      // Load document from private S3
       const parsed = parseS3Url(session.document_url);
       if (!parsed) {
-        return res.status(500).json({ error: "Invalid document_url format in session" });
+        return res
+          .status(500)
+          .json({ error: "Invalid document_url format in session" });
       }
 
       const docObj = await s3.send(
@@ -561,29 +658,60 @@ export default async function handler(req, res) {
       const verificationScore =
         (isLive ? 0.4 : 0) + livenessScore * 0.3 + similarity * 0.3;
 
-      // your earlier code used 0.65 — keep it
+      // Keep your current threshold
       const isVerified = isLive && similarity >= 0.65;
+
+      // If verified, increment count (but don't exceed expected)
+      let verifiedAfter = verifiedBefore;
+      if (isVerified) {
+        verifiedAfter = Math.min(verifiedBefore + 1, expected);
+      }
+
+      const requiresAdditionalGuest = verifiedAfter < expected;
+
+      // Status logic:
+      // - if not verified: failed
+      // - if verified but more guests required: partial_verified
+      // - if verified and no more required: verified
+      let statusToSet = "failed";
+      if (isVerified && requiresAdditionalGuest) statusToSet = "partial_verified";
+      if (isVerified && !requiresAdditionalGuest) statusToSet = "verified";
+
+      // Keep a single "is_verified" meaning "overall done"
+      const overallVerified = isVerified && !requiresAdditionalGuest;
 
       const { error: updateError } = await supabase
         .from("demo_sessions")
         .update({
-          status: isVerified ? "verified" : "failed",
+          status: statusToSet,
           current_step: "results",
+
+          // latest selfie pointer (kept for backwards compatibility)
           selfie_url: selfieUrl,
-          is_verified: isVerified,
+
+          // scores
+          is_verified: overallVerified,
           verification_score: verificationScore,
           liveness_score: livenessScore,
           face_match_score: similarity,
+
+          // multi-guest tracking
+          expected_guest_count: expected,
+          verified_guest_count: verifiedAfter,
+          requires_additional_guest: requiresAdditionalGuest,
+
           updated_at: new Date().toISOString(),
         })
         .eq("session_token", session_token);
 
       if (updateError) {
         console.error("Error updating verification session:", updateError);
-        return res.status(500).json({ error: "Failed to save verification result" });
+        return res
+          .status(500)
+          .json({ error: "Failed to save verification result" });
       }
 
-      // Optional: costs + stats (non-blocking)
+      // Optional costs + stats (non-blocking)
       try {
         await supabase.from("demo_api_costs").insert([
           { session_id: session_token, operation: "liveness", cost_usd: 0.001 },
@@ -593,9 +721,10 @@ export default async function handler(req, res) {
         console.warn("Cost insert failed (non-blocking):", e?.message || e);
       }
 
+      // Only count "verified" when the whole booking is completed (overallVerified)
       try {
         await supabase.rpc("increment_demo_stats", {
-          verified: isVerified,
+          verified: overallVerified,
           cost: 0.052,
         });
       } catch (e) {
@@ -604,12 +733,27 @@ export default async function handler(req, res) {
 
       return res.json({
         success: true,
-        is_verified: isVerified,
+
+        // Backwards compatible fields
+        is_verified: overallVerified,
+
+        // New multi-guest signal fields (frontend can ignore for now)
+        expected_guest_count: expected,
+        verified_guest_count: verifiedAfter,
+        requires_additional_guest: requiresAdditionalGuest,
+        remaining_guest_verifications: Math.max(expected - verifiedAfter, 0),
+
         data: {
           liveness_score: livenessScore,
           face_match_score: similarity,
           verification_score: verificationScore,
-          is_verified: isVerified,
+
+          // For UI logic if/when you want it
+          is_verified: overallVerified,
+          requires_additional_guest: requiresAdditionalGuest,
+          expected_guest_count: expected,
+          verified_guest_count: verifiedAfter,
+          remaining_guest_verifications: Math.max(expected - verifiedAfter, 0),
         },
       });
     }
