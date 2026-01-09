@@ -1,10 +1,6 @@
 import crypto from "crypto";
 import { createClient } from "@supabase/supabase-js";
-import {
-  S3Client,
-  PutObjectCommand,
-  GetObjectCommand,
-} from "@aws-sdk/client-s3";
+import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
 import {
   RekognitionClient,
   CompareFacesCommand,
@@ -12,14 +8,9 @@ import {
 } from "@aws-sdk/client-rekognition";
 import { TextractClient, AnalyzeIDCommand } from "@aws-sdk/client-textract";
 
-/**
- * =========================
- * ENV
- * =========================
- */
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
-const AWS_REGION = process.env.AWS_REGION; // should match S3 bucket region (ap-southeast-2)
+const AWS_REGION = process.env.AWS_REGION;
 const BUCKET = process.env.S3_BUCKET_NAME;
 
 if (!SUPABASE_URL) console.warn("Missing env: NEXT_PUBLIC_SUPABASE_URL");
@@ -27,23 +18,12 @@ if (!SUPABASE_SERVICE_KEY) console.warn("Missing env: SUPABASE_SERVICE_KEY");
 if (!AWS_REGION) console.warn("Missing env: AWS_REGION");
 if (!BUCKET) console.warn("Missing env: S3_BUCKET_NAME");
 
-/**
- * =========================
- * CLIENTS
- * =========================
- */
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 const s3 = new S3Client({ region: AWS_REGION });
 const rekognition = new RekognitionClient({ region: AWS_REGION });
 const textract = new TextractClient({ region: AWS_REGION });
 
-/**
- * =========================
- * HELPERS
- * =========================
- */
 function setCors(res) {
-  // Production harden later: replace '*' with https://quest-id-flow.lovable.app
   res.setHeader("Access-Control-Allow-Credentials", "true");
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS,POST");
@@ -65,11 +45,6 @@ async function streamToBuffer(readable) {
   return Buffer.concat(chunks);
 }
 
-/**
- * Accepts either:
- * - raw base64
- * - data URL ("data:image/jpeg;base64,...")
- */
 function normalizeBase64(base64OrDataUrl) {
   if (typeof base64OrDataUrl !== "string") return null;
   if (base64OrDataUrl.startsWith("data:image/")) {
@@ -82,8 +57,7 @@ function inferStepFromSession(session) {
   if (!session) return "welcome";
   if (session?.current_step) return session.current_step;
 
-  if (session?.is_verified === true || session?.verification_score != null)
-    return "results";
+  if (session?.is_verified === true || session?.verification_score != null) return "results";
   if (session?.selfie_url) return "results";
   if (session?.document_url) return "selfie";
   if (session?.guest_name || session?.room_number) return "document";
@@ -137,10 +111,7 @@ function parseAnalyzeIdFields(fields = []) {
   };
 }
 
-/**
- * Non-blocking-ish Textract with timeout.
- */
-async function runTextractAnalyzeIdWithTimeout(imageBuffer, timeoutMs = 1500) {
+async function runTextractAnalyzeIdWithTimeout(imageBuffer, timeoutMs = 15000) {
   const run = async () => {
     const res = await textract.send(
       new AnalyzeIDCommand({
@@ -155,10 +126,7 @@ async function runTextractAnalyzeIdWithTimeout(imageBuffer, timeoutMs = 1500) {
     const data = await Promise.race([
       run(),
       new Promise((_, reject) =>
-        setTimeout(
-          () => reject(new Error(`Textract timeout after ${timeoutMs}ms`)),
-          timeoutMs
-        )
+        setTimeout(() => reject(new Error(`Textract timeout after ${timeoutMs}ms`)), timeoutMs)
       ),
     ]);
     return { ok: true, data };
@@ -180,11 +148,6 @@ function clampInt(n, min, max) {
   return Math.min(Math.max(x, min), max);
 }
 
-/**
- * =========================
- * HANDLER
- * =========================
- */
 export default async function handler(req, res) {
   setCors(res);
 
@@ -201,21 +164,11 @@ export default async function handler(req, res) {
 
   try {
     if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
-      return res
-        .status(500)
-        .json({ error: "Server misconfigured: missing Supabase env vars" });
+      return res.status(500).json({ error: "Server misconfigured: missing Supabase env vars" });
     }
 
-    /**
-     * =========================
-     * ACTION: start
-     * - initialize expected/verified counts
-     * =========================
-     */
     if (action === "start") {
       const token = generateToken();
-
-      // Default: 1 guest expected until Cloudbeds provides actual count.
       const expected_guest_count = 1;
       const verified_guest_count = 0;
       const requires_additional_guest = expected_guest_count > verified_guest_count;
@@ -241,16 +194,9 @@ export default async function handler(req, res) {
       });
     }
 
-    /**
-     * =========================
-     * ACTION: get_session
-     * =========================
-     */
     if (action === "get_session") {
       const { session_token } = req.body || {};
-      if (!session_token) {
-        return res.status(400).json({ error: "Session token required" });
-      }
+      if (!session_token) return res.status(400).json({ error: "Session token required" });
 
       const { data: session, error } = await supabase
         .from("demo_sessions")
@@ -281,16 +227,12 @@ export default async function handler(req, res) {
         .eq("session_token", session_token)
         .single();
 
-      if (error || !session) {
-        return res.status(404).json({ error: "Session not found" });
-      }
+      if (error || !session) return res.status(404).json({ error: "Session not found" });
 
       const current_step = inferStepFromSession(session);
-
       const expected = clampInt(session.expected_guest_count, 1, 10);
       const verified = clampInt(session.verified_guest_count, 0, 10);
 
-      // If DB has null, compute safely
       const requires =
         session.requires_additional_guest === true
           ? true
@@ -330,18 +272,9 @@ export default async function handler(req, res) {
       });
     }
 
-    /**
-     * =========================
-     * ACTION: log_consent
-     * =========================
-     */
     if (action === "log_consent") {
-      const { session_token, consent_given, consent_time, consent_locale } =
-        req.body || {};
-
-      if (!session_token) {
-        return res.status(400).json({ error: "Session token required" });
-      }
+      const { session_token, consent_given, consent_time, consent_locale } = req.body || {};
+      if (!session_token) return res.status(400).json({ error: "Session token required" });
 
       const { data: existing, error: findError } = await supabase
         .from("demo_sessions")
@@ -349,9 +282,7 @@ export default async function handler(req, res) {
         .eq("session_token", session_token)
         .single();
 
-      if (findError || !existing) {
-        return res.status(404).json({ error: "Session not found" });
-      }
+      if (findError || !existing) return res.status(404).json({ error: "Session not found" });
 
       const { error: updateError } = await supabase
         .from("demo_sessions")
@@ -373,32 +304,13 @@ export default async function handler(req, res) {
       return res.json({ success: true, message: "Consent logged successfully" });
     }
 
-    /**
-     * =========================
-     * ACTION: update_guest
-     * - Persist Step 1 so refresh resumes at Document step
-     * - Optional: allow caller to set expected_guest_count now (for testing)
-     * =========================
-     */
     if (action === "update_guest") {
-      const {
-        session_token,
-        guest_name,
-        booking_ref,
-        room_number,
-        expected_guest_count,
-      } = req.body || {};
-
-      if (!session_token) {
-        return res.status(400).json({ error: "Session token required" });
-      }
+      const { session_token, guest_name, booking_ref, room_number, expected_guest_count } = req.body || {};
+      if (!session_token) return res.status(400).json({ error: "Session token required" });
 
       const bookingValue = booking_ref || room_number || null;
-
-      // Optional override for testing (defaults unchanged if omitted)
       const expectedOverride = toIntOrNull(expected_guest_count);
-      const expectedToSet =
-        expectedOverride === null ? undefined : clampInt(expectedOverride, 1, 10);
+      const expectedToSet = expectedOverride === null ? undefined : clampInt(expectedOverride, 1, 10);
 
       const updatePayload = {
         guest_name: guest_name || null,
@@ -410,8 +322,7 @@ export default async function handler(req, res) {
 
       if (expectedToSet !== undefined) {
         updatePayload.expected_guest_count = expectedToSet;
-        // do not change verified count here; only in verify_face success
-        // but do update requires flag based on current verified
+
         const { data: s, error: sErr } = await supabase
           .from("demo_sessions")
           .select("verified_guest_count")
@@ -437,35 +348,18 @@ export default async function handler(req, res) {
       return res.json({ success: true });
     }
 
-    /**
-     * =========================
-     * ACTION: upload_document
-     * - uploads to S3
-     * - runs Textract non-blocking (backend only)
-     * =========================
-     */
     if (action === "upload_document") {
       const { session_token, image_data, guest_name, room_number } = req.body || {};
 
-      if (!session_token)
-        return res.status(400).json({ error: "Session token required" });
-      if (!image_data)
-        return res.status(400).json({ error: "image_data required" });
-
-      if (!AWS_REGION || !BUCKET) {
-        return res
-          .status(500)
-          .json({ error: "Server misconfigured: missing AWS env vars" });
-      }
+      if (!session_token) return res.status(400).json({ error: "Session token required" });
+      if (!image_data) return res.status(400).json({ error: "image_data required" });
+      if (!AWS_REGION || !BUCKET) return res.status(500).json({ error: "Server misconfigured: missing AWS env vars" });
 
       const base64Data = normalizeBase64(image_data);
-      if (!base64Data)
-        return res.status(400).json({ error: "Invalid image_data format" });
+      if (!base64Data) return res.status(400).json({ error: "Invalid image_data format" });
 
       const imageBuffer = Buffer.from(base64Data, "base64");
-      if (imageBuffer.length < 1000) {
-        return res.status(400).json({ error: "Image too small" });
-      }
+      if (imageBuffer.length < 1000) return res.status(400).json({ error: "Image too small" });
 
       const s3Key = `demo/${session_token}/document.jpg`;
 
@@ -480,40 +374,6 @@ export default async function handler(req, res) {
 
       const documentUrl = `s3://${BUCKET}/${s3Key}`;
 
-      const textractResult = await runTextractAnalyzeIdWithTimeout(
-        imageBuffer,
-        1500
-      );
-
-      let extractedText = "Text extraction unavailable";
-      let extractedStructured = null;
-
-      if (textractResult.ok) {
-        extractedStructured = textractResult.data;
-        extractedText =
-          [
-            extractedStructured.full_name
-              ? `Name: ${extractedStructured.full_name}`
-              : null,
-            extractedStructured.nationality
-              ? `Nationality: ${extractedStructured.nationality}`
-              : null,
-            extractedStructured.dob ? `DOB: ${extractedStructured.dob}` : null,
-            extractedStructured.document_number
-              ? `Doc#: ${extractedStructured.document_number}`
-              : null,
-          ]
-            .filter(Boolean)
-            .join(" | ") ||
-          "Textract extracted fields (see extracted_info.textract)";
-      } else {
-        extractedText = "Textract unavailable (non-blocking)";
-        console.warn(
-          "Textract AnalyzeID failed (non-blocking):",
-          textractResult.error
-        );
-      }
-
       const { error: updateError } = await supabase
         .from("demo_sessions")
         .update({
@@ -523,10 +383,10 @@ export default async function handler(req, res) {
           guest_name: guest_name || null,
           room_number: room_number || null,
           extracted_info: {
-            text: extractedText,
-            textract: extractedStructured,
-            textract_ok: textractResult.ok,
-            textract_error: textractResult.ok ? null : textractResult.error,
+            text: "Textract pending (async)",
+            textract_ok: null,
+            textract_error: null,
+            textract: null,
           },
           updated_at: new Date().toISOString(),
         })
@@ -537,36 +397,64 @@ export default async function handler(req, res) {
         return res.status(500).json({ error: "Failed to save document state" });
       }
 
+      runTextractAnalyzeIdWithTimeout(imageBuffer, 15000)
+        .then(async (result) => {
+          if (result.ok) {
+            const extracted = result.data;
+            const extractedText =
+              [
+                extracted.full_name ? `Name: ${extracted.full_name}` : null,
+                extracted.nationality ? `Nationality: ${extracted.nationality}` : null,
+                extracted.dob ? `DOB: ${extracted.dob}` : null,
+                extracted.document_number ? `Doc#: ${extracted.document_number}` : null,
+              ]
+                .filter(Boolean)
+                .join(" | ") || "Textract extracted fields";
+
+            await supabase
+              .from("demo_sessions")
+              .update({
+                extracted_info: {
+                  text: extractedText,
+                  textract_ok: true,
+                  textract_error: null,
+                  textract: extracted,
+                },
+                updated_at: new Date().toISOString(),
+              })
+              .eq("session_token", session_token);
+          } else {
+            await supabase
+              .from("demo_sessions")
+              .update({
+                extracted_info: {
+                  text: "Textract failed (async)",
+                  textract_ok: false,
+                  textract_error: result.error,
+                  textract: null,
+                },
+                updated_at: new Date().toISOString(),
+              })
+              .eq("session_token", session_token);
+          }
+        })
+        .catch((e) => {
+          console.warn("Textract async crash:", e?.message || e);
+        });
+
       return res.json({
         success: true,
-        extracted_text: extractedText.substring(0, 200),
-        data: extractedStructured
-          ? { extracted_text: extractedText, extracted_fields: extractedStructured }
-          : { extracted_text: extractedText },
+        extracted_text: "Textract pending (async)",
+        data: { extracted_text: "Textract pending (async)" },
       });
     }
 
-    /**
-     * =========================
-     * ACTION: verify_face
-     * - if verification succeeds, increment verified_guest_count
-     * - compute requires_additional_guest
-     * - return signal to frontend (no new UI step required)
-     * =========================
-     */
     if (action === "verify_face") {
       const { session_token, selfie_data } = req.body || {};
 
-      if (!session_token)
-        return res.status(400).json({ error: "Session token required" });
-      if (!selfie_data)
-        return res.status(400).json({ error: "selfie_data required" });
-
-      if (!AWS_REGION || !BUCKET) {
-        return res
-          .status(500)
-          .json({ error: "Server misconfigured: missing AWS env vars" });
-      }
+      if (!session_token) return res.status(400).json({ error: "Session token required" });
+      if (!selfie_data) return res.status(400).json({ error: "selfie_data required" });
+      if (!AWS_REGION || !BUCKET) return res.status(500).json({ error: "Server misconfigured: missing AWS env vars" });
 
       const { data: session, error: sessionError } = await supabase
         .from("demo_sessions")
@@ -574,27 +462,18 @@ export default async function handler(req, res) {
         .eq("session_token", session_token)
         .single();
 
-      if (sessionError || !session) {
-        return res.status(404).json({ error: "Session not found" });
-      }
-
-      if (!session?.document_url) {
-        return res.status(400).json({ error: "Document not uploaded" });
-      }
+      if (sessionError || !session) return res.status(404).json({ error: "Session not found" });
+      if (!session?.document_url) return res.status(400).json({ error: "Document not uploaded" });
 
       const selfieBase64 = normalizeBase64(selfie_data);
-      if (!selfieBase64)
-        return res.status(400).json({ error: "Invalid selfie_data format" });
+      if (!selfieBase64) return res.status(400).json({ error: "Invalid selfie_data format" });
 
       const selfieBuffer = Buffer.from(selfieBase64, "base64");
-      if (selfieBuffer.length < 1000) {
-        return res.status(400).json({ error: "Image too small" });
-      }
+      if (selfieBuffer.length < 1000) return res.status(400).json({ error: "Image too small" });
 
       const expected = clampInt(session.expected_guest_count, 1, 10);
       const verifiedBefore = clampInt(session.verified_guest_count, 0, 10);
 
-      // Save each selfie separately so multiple guests don't overwrite.
       const selfieIndex = Math.min(verifiedBefore + 1, 10);
       const selfieKey = `demo/${session_token}/selfie_${selfieIndex}.jpg`;
 
@@ -609,7 +488,6 @@ export default async function handler(req, res) {
 
       const selfieUrl = `s3://${BUCKET}/${selfieKey}`;
 
-      // Liveness-ish heuristic (not true liveness)
       const livenessResult = await rekognition.send(
         new DetectFacesCommand({
           Image: { Bytes: selfieBuffer },
@@ -618,18 +496,11 @@ export default async function handler(req, res) {
       );
 
       const face = livenessResult.FaceDetails?.[0];
-      const isLive =
-        Boolean(face?.EyesOpen?.Value) &&
-        (face?.Quality?.Brightness || 0) > 40;
+      const isLive = Boolean(face?.EyesOpen?.Value) && (face?.Quality?.Brightness || 0) > 40;
       const livenessScore = (face?.Confidence || 0) / 100;
 
-      // Load document from private S3
       const parsed = parseS3Url(session.document_url);
-      if (!parsed) {
-        return res
-          .status(500)
-          .json({ error: "Invalid document_url format in session" });
-      }
+      if (!parsed) return res.status(500).json({ error: "Invalid document_url format in session" });
 
       const docObj = await s3.send(
         new GetObjectCommand({
@@ -639,9 +510,7 @@ export default async function handler(req, res) {
       );
 
       const docStream = docObj.Body;
-      if (!docStream) {
-        return res.status(500).json({ error: "Failed to read document from S3" });
-      }
+      if (!docStream) return res.status(500).json({ error: "Failed to read document from S3" });
 
       const docBuffer = await streamToBuffer(docStream);
 
@@ -655,29 +524,18 @@ export default async function handler(req, res) {
 
       const similarity = (compareResult.FaceMatches?.[0]?.Similarity || 0) / 100;
 
-      const verificationScore =
-        (isLive ? 0.4 : 0) + livenessScore * 0.3 + similarity * 0.3;
-
-      // Keep your current threshold
+      const verificationScore = (isLive ? 0.4 : 0) + livenessScore * 0.3 + similarity * 0.3;
       const isVerified = isLive && similarity >= 0.65;
 
-      // If verified, increment count (but don't exceed expected)
       let verifiedAfter = verifiedBefore;
-      if (isVerified) {
-        verifiedAfter = Math.min(verifiedBefore + 1, expected);
-      }
+      if (isVerified) verifiedAfter = Math.min(verifiedBefore + 1, expected);
 
       const requiresAdditionalGuest = verifiedAfter < expected;
 
-      // Status logic:
-      // - if not verified: failed
-      // - if verified but more guests required: partial_verified
-      // - if verified and no more required: verified
       let statusToSet = "failed";
       if (isVerified && requiresAdditionalGuest) statusToSet = "partial_verified";
       if (isVerified && !requiresAdditionalGuest) statusToSet = "verified";
 
-      // Keep a single "is_verified" meaning "overall done"
       const overallVerified = isVerified && !requiresAdditionalGuest;
 
       const { error: updateError } = await supabase
@@ -685,33 +543,23 @@ export default async function handler(req, res) {
         .update({
           status: statusToSet,
           current_step: "results",
-
-          // latest selfie pointer (kept for backwards compatibility)
           selfie_url: selfieUrl,
-
-          // scores
           is_verified: overallVerified,
           verification_score: verificationScore,
           liveness_score: livenessScore,
           face_match_score: similarity,
-
-          // multi-guest tracking
           expected_guest_count: expected,
           verified_guest_count: verifiedAfter,
           requires_additional_guest: requiresAdditionalGuest,
-
           updated_at: new Date().toISOString(),
         })
         .eq("session_token", session_token);
 
       if (updateError) {
         console.error("Error updating verification session:", updateError);
-        return res
-          .status(500)
-          .json({ error: "Failed to save verification result" });
+        return res.status(500).json({ error: "Failed to save verification result" });
       }
 
-      // Optional costs + stats (non-blocking)
       try {
         await supabase.from("demo_api_costs").insert([
           { session_id: session_token, operation: "liveness", cost_usd: 0.001 },
@@ -721,7 +569,6 @@ export default async function handler(req, res) {
         console.warn("Cost insert failed (non-blocking):", e?.message || e);
       }
 
-      // Only count "verified" when the whole booking is completed (overallVerified)
       try {
         await supabase.rpc("increment_demo_stats", {
           verified: overallVerified,
@@ -733,22 +580,15 @@ export default async function handler(req, res) {
 
       return res.json({
         success: true,
-
-        // Backwards compatible fields
         is_verified: overallVerified,
-
-        // New multi-guest signal fields (frontend can ignore for now)
         expected_guest_count: expected,
         verified_guest_count: verifiedAfter,
         requires_additional_guest: requiresAdditionalGuest,
         remaining_guest_verifications: Math.max(expected - verifiedAfter, 0),
-
         data: {
           liveness_score: livenessScore,
           face_match_score: similarity,
           verification_score: verificationScore,
-
-          // For UI logic if/when you want it
           is_verified: overallVerified,
           requires_additional_guest: requiresAdditionalGuest,
           expected_guest_count: expected,
@@ -761,8 +601,6 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "Invalid action" });
   } catch (error) {
     console.error("Error:", error);
-    return res.status(500).json({
-      error: error?.message || "Unknown server error",
-    });
+    return res.status(500).json({ error: error?.message || "Unknown server error" });
   }
 }
