@@ -202,7 +202,6 @@ export default async function handler(req, res) {
         .from("demo_sessions")
         .select(
           [
-            "id",
             "session_token",
             "status",
             "current_step",
@@ -246,7 +245,6 @@ export default async function handler(req, res) {
       return res.json({
         success: true,
         session: {
-          id: session.id ?? null,
           session_token: session.session_token,
           status: session.status ?? null,
           current_step,
@@ -356,14 +354,8 @@ export default async function handler(req, res) {
     }
 
     if (action === "tm30_update") {
-      const { session_token, id, tm30_info } = req.body || {};
-
-      const matchCol = session_token ? "session_token" : id ? "id" : null;
-      const matchVal = session_token || id || null;
-
-      if (!matchCol || !matchVal) {
-        return res.status(400).json({ error: "session_token or id required" });
-      }
+      const { session_token, tm30_info } = req.body || {};
+      if (!session_token) return res.status(400).json({ error: "Session token required" });
 
       const payload = tm30_info && typeof tm30_info === "object" ? tm30_info : {};
 
@@ -390,7 +382,7 @@ export default async function handler(req, res) {
           tm30_status,
           updated_at: new Date().toISOString(),
         })
-        .eq(matchCol, matchVal)
+        .eq("session_token", session_token)
         .select("*")
         .single();
 
@@ -649,7 +641,7 @@ export default async function handler(req, res) {
           face_match_score: similarity,
           verification_score: verificationScore,
           is_verified: overallVerified,
-          requires_additional_guest: requiresAdditional_guest,
+          requires_additional_guest: requiresAdditionalGuest,
           expected_guest_count: expected,
           verified_guest_count: verifiedAfter,
           remaining_guest_verifications: Math.max(expected - verifiedAfter, 0),
