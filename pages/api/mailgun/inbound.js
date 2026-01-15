@@ -36,7 +36,7 @@ function toStr(v) {
 }
 
 function verifyMailgunSignature(fields) {
-  const apiKey = process.env.MAILGUN_API_KEY;
+  const apiKey = process.env.MAILGUN_WEBHOOK_SIGNING_KEY;
   if (!apiKey) return { ok: true, skipped: true };
 
   const timestamp = toStr(fields.timestamp);
