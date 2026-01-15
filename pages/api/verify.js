@@ -53,7 +53,6 @@ function normalizeBase64(base64OrDataUrl) {
   return base64OrDataUrl;
 }
 
-// ✅ NEW: Normalize guest name and reservation number for email match
 function normalizeGuestName(name) {
   return String(name || "")
     .toLowerCase()
@@ -150,8 +149,7 @@ function parseAnalyzeIdFields(fields = []) {
     if (key && val) raw[key] = val;
   }
 
-  const first_name =
-    raw.first_name || raw.firstname || raw.given_name || raw.givenname || null;
+  const first_name = raw.first_name || raw.firstname || raw.given_name || raw.givenname || null;
 
   const middle_name =
     raw.middle_name || raw.middlename || raw.second_name || raw.secondname || null;
@@ -415,7 +413,6 @@ export default async function handler(req, res) {
 
       const bookingValue = booking_ref || room_number || null;
 
-      // ✅ NEW: email-based reservation verification gate
       if (!guest_name || !bookingValue) {
         return res.status(400).json({ error: "Guest name and reservation number are required" });
       }
@@ -423,9 +420,10 @@ export default async function handler(req, res) {
       const guestNameNorm = normalizeGuestName(guest_name);
       const resNorm = normalizeReservationNumber(bookingValue);
 
+      // ✅ UPDATED: also select adults/children so we can set expected_guest_count automatically
       const { data: matches, error: matchErr } = await supabase
         .from("booking_email_index")
-        .select("id")
+        .select("id, adults, children")
         .eq("guest_name_norm", guestNameNorm)
         .or(`confirmation_number_norm.eq.${resNorm},source_reservation_id_norm.eq.${resNorm}`)
         .limit(1);
@@ -442,32 +440,35 @@ export default async function handler(req, res) {
         });
       }
 
+      // ✅ NEW: set expected_guest_count from booking email (Adults only for v1)
+      const bookingRow = matches[0];
+      const adultsFromEmail = Number.isFinite(Number(bookingRow.adults))
+        ? Number(bookingRow.adults)
+        : 1;
+      const expectedFromEmail = clampInt(adultsFromEmail, 1, 10);
+
+      // Allow manual override ONLY if provided; otherwise use email adults
       const expectedOverride = toIntOrNull(expected_guest_count);
       const expectedToSet =
-        expectedOverride === null ? undefined : clampInt(expectedOverride, 1, 10);
+        expectedOverride === null ? expectedFromEmail : clampInt(expectedOverride, 1, 10);
+
+      const { data: s, error: sErr } = await supabase
+        .from("demo_sessions")
+        .select("verified_guest_count")
+        .eq("session_token", session_token)
+        .single();
+
+      const verified = !sErr && s ? clampInt(s.verified_guest_count, 0, 10) : 0;
 
       const updatePayload = {
         guest_name: guest_name || null,
         room_number: bookingValue,
         status: "guest_info_saved",
         current_step: "document",
+        expected_guest_count: expectedToSet,
+        requires_additional_guest: verified < expectedToSet,
         updated_at: new Date().toISOString(),
       };
-
-      if (expectedToSet !== undefined) {
-        updatePayload.expected_guest_count = expectedToSet;
-
-        const { data: s, error: sErr } = await supabase
-          .from("demo_sessions")
-          .select("verified_guest_count")
-          .eq("session_token", session_token)
-          .single();
-
-        if (!sErr && s) {
-          const verified = clampInt(s.verified_guest_count, 0, 10);
-          updatePayload.requires_additional_guest = verified < expectedToSet;
-        }
-      }
 
       const { error: updateError } = await supabase
         .from("demo_sessions")
@@ -479,7 +480,13 @@ export default async function handler(req, res) {
         return res.status(500).json({ error: "Failed to save guest info" });
       }
 
-      return res.json({ success: true });
+      return res.json({
+        success: true,
+        expected_guest_count: expectedToSet,
+        verified_guest_count: verified,
+        requires_additional_guest: verified < expectedToSet,
+        remaining_guest_verifications: Math.max(expectedToSet - verified, 0),
+      });
     }
 
     if (action === "tm30_update") {
