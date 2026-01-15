@@ -124,16 +124,15 @@ export default async function handler(req, res) {
 
   try {
     const { fields } = await parseForm(req);
-/*
-// 
+ 
     // 1) Verify Mailgun authenticity (now that you added the key)
     const sig = verifyMailgunSignature(fields);
     if (!sig.ok) {
       console.warn("❌ Mailgun signature failed:", sig.reason);
       return res.status(401).json({ success: false, error: "Unauthorized" });
     }
-*/
-    // 2) Pull safe top-level fields
+
+ // 2) Pull safe top-level fields
     const recipient = toStr(fields.recipient);
     const from = toStr(fields.from);
     const subject = toStr(fields.subject);
