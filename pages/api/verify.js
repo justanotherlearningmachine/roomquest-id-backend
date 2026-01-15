@@ -79,12 +79,6 @@ function inferStepFromSession(session) {
   return "welcome";
 }
 
-function parseS3Url(s3Url) {
-  const match = String(s3Url || "").match(/^s3:\/\/([^/]+)\/(.+)$/);
-  if (!match) return null;
-  return { bucket: match[1], key: match[2] };
-}
-
 function normalizeKey(k = "") {
   return String(k).trim().toLowerCase().replace(/\s+/g, "_");
 }
@@ -420,7 +414,6 @@ export default async function handler(req, res) {
       const guestNameNorm = normalizeGuestName(guest_name);
       const resNorm = normalizeReservationNumber(bookingValue);
 
-      // ✅ UPDATED: also select adults/children so we can set expected_guest_count automatically
       const { data: matches, error: matchErr } = await supabase
         .from("booking_email_index")
         .select("id, adults, children")
@@ -440,14 +433,12 @@ export default async function handler(req, res) {
         });
       }
 
-      // ✅ NEW: set expected_guest_count from booking email (Adults only for v1)
       const bookingRow = matches[0];
       const adultsFromEmail = Number.isFinite(Number(bookingRow.adults))
         ? Number(bookingRow.adults)
         : 1;
       const expectedFromEmail = clampInt(adultsFromEmail, 1, 10);
 
-      // Allow manual override ONLY if provided; otherwise use email adults
       const expectedOverride = toIntOrNull(expected_guest_count);
       const expectedToSet =
         expectedOverride === null ? expectedFromEmail : clampInt(expectedOverride, 1, 10);
@@ -536,12 +527,30 @@ export default async function handler(req, res) {
     }
 
     if (action === "upload_document") {
-      const { session_token, image_data, guest_name, room_number } = req.body || {};
+      const { session_token, image_data } = req.body || {};
 
       if (!session_token) return res.status(400).json({ error: "Session token required" });
       if (!image_data) return res.status(400).json({ error: "image_data required" });
       if (!AWS_REGION || !BUCKET)
         return res.status(500).json({ error: "Server misconfigured: missing AWS env vars" });
+
+      // ✅ Gate: must have completed Step 1 (reservation verification)
+      const { data: sess, error: sessErr } = await supabase
+        .from("demo_sessions")
+        .select("guest_name, room_number, expected_guest_count, verified_guest_count")
+        .eq("session_token", session_token)
+        .single();
+
+      if (sessErr || !sess) return res.status(404).json({ error: "Session not found" });
+      if (!sess.guest_name || !sess.room_number) {
+        return res.status(403).json({ error: "Complete Step 1 (reservation verification) first." });
+      }
+
+      const expected = clampInt(sess.expected_guest_count, 1, 10);
+      const verifiedBefore = clampInt(sess.verified_guest_count, 0, 10);
+
+      // ✅ Current guest index = next person to verify
+      const guestIndex = clampInt(verifiedBefore + 1, 1, expected);
 
       const base64Data = normalizeBase64(image_data);
       if (!base64Data) return res.status(400).json({ error: "Invalid image_data format" });
@@ -549,7 +558,8 @@ export default async function handler(req, res) {
       const imageBuffer = Buffer.from(base64Data, "base64");
       if (imageBuffer.length < 1000) return res.status(400).json({ error: "Image too small" });
 
-      const s3Key = `demo/${session_token}/document.jpg`;
+      // ✅ Save per-guest document
+      const s3Key = `demo/${session_token}/document_${guestIndex}.jpg`;
 
       await s3.send(
         new PutObjectCommand({
@@ -567,14 +577,13 @@ export default async function handler(req, res) {
         .update({
           status: "document_uploaded",
           current_step: "selfie",
-          document_url: documentUrl,
-          guest_name: guest_name || null,
-          room_number: room_number || null,
+          document_url: documentUrl, // keep latest for UI/debug
           extracted_info: {
-            text: "Textract pending (async)",
+            text: `Textract pending (async) [guest ${guestIndex}]`,
             textract_ok: null,
             textract_error: null,
             textract: null,
+            guest_index: guestIndex,
           },
           updated_at: new Date().toISOString(),
         })
@@ -609,10 +618,11 @@ export default async function handler(req, res) {
               .from("demo_sessions")
               .update({
                 extracted_info: {
-                  text: extractedText,
+                  text: `${extractedText} [guest ${guestIndex}]`,
                   textract_ok: true,
                   textract_error: null,
                   textract: extracted,
+                  guest_index: guestIndex,
                 },
                 updated_at: new Date().toISOString(),
               })
@@ -622,10 +632,11 @@ export default async function handler(req, res) {
               .from("demo_sessions")
               .update({
                 extracted_info: {
-                  text: "Textract failed (async)",
+                  text: `Textract failed (async) [guest ${guestIndex}]`,
                   textract_ok: false,
                   textract_error: result.error,
                   textract: null,
+                  guest_index: guestIndex,
                 },
                 updated_at: new Date().toISOString(),
               })
@@ -638,8 +649,9 @@ export default async function handler(req, res) {
 
       return res.json({
         success: true,
-        extracted_text: "Textract pending (async)",
-        data: { extracted_text: "Textract pending (async)" },
+        guest_index: guestIndex,
+        extracted_text: `Textract pending (async) [guest ${guestIndex}]`,
+        data: { extracted_text: `Textract pending (async) [guest ${guestIndex}]`, guest_index: guestIndex },
       });
     }
 
@@ -658,7 +670,32 @@ export default async function handler(req, res) {
         .single();
 
       if (sessionError || !session) return res.status(404).json({ error: "Session not found" });
-      if (!session?.document_url) return res.status(400).json({ error: "Document not uploaded" });
+
+      const expected = clampInt(session.expected_guest_count, 1, 10);
+      const verifiedBefore = clampInt(session.verified_guest_count, 0, 10);
+
+      // ✅ This guest index must match the document index
+      const guestIndex = clampInt(verifiedBefore + 1, 1, expected);
+
+      // ✅ Ensure the per-guest document exists / is readable
+      const docKey = `demo/${session_token}/document_${guestIndex}.jpg`;
+
+      let docBuffer;
+      try {
+        const docObj = await s3.send(
+          new GetObjectCommand({
+            Bucket: BUCKET,
+            Key: docKey,
+          })
+        );
+        const docStream = docObj.Body;
+        if (!docStream) return res.status(500).json({ error: "Failed to read document from S3" });
+        docBuffer = await streamToBuffer(docStream);
+      } catch (e) {
+        return res.status(400).json({
+          error: `Document not uploaded for guest ${guestIndex}. Please upload the ID first.`,
+        });
+      }
 
       const selfieBase64 = normalizeBase64(selfie_data);
       if (!selfieBase64) return res.status(400).json({ error: "Invalid selfie_data format" });
@@ -666,11 +703,7 @@ export default async function handler(req, res) {
       const selfieBuffer = Buffer.from(selfieBase64, "base64");
       if (selfieBuffer.length < 1000) return res.status(400).json({ error: "Image too small" });
 
-      const expected = clampInt(session.expected_guest_count, 1, 10);
-      const verifiedBefore = clampInt(session.verified_guest_count, 0, 10);
-
-      const selfieIndex = Math.min(verifiedBefore + 1, 10);
-      const selfieKey = `demo/${session_token}/selfie_${selfieIndex}.jpg`;
+      const selfieKey = `demo/${session_token}/selfie_${guestIndex}.jpg`;
 
       await s3.send(
         new PutObjectCommand({
@@ -693,21 +726,6 @@ export default async function handler(req, res) {
       const face = livenessResult.FaceDetails?.[0];
       const isLive = Boolean(face?.EyesOpen?.Value) && (face?.Quality?.Brightness || 0) > 40;
       const livenessScore = (face?.Confidence || 0) / 100;
-
-      const parsed = parseS3Url(session.document_url);
-      if (!parsed) return res.status(500).json({ error: "Invalid document_url format in session" });
-
-      const docObj = await s3.send(
-        new GetObjectCommand({
-          Bucket: parsed.bucket,
-          Key: parsed.key,
-        })
-      );
-
-      const docStream = docObj.Body;
-      if (!docStream) return res.status(500).json({ error: "Failed to read document from S3" });
-
-      const docBuffer = await streamToBuffer(docStream);
 
       const compareResult = await rekognition.send(
         new CompareFacesCommand({
@@ -738,7 +756,8 @@ export default async function handler(req, res) {
         .update({
           status: statusToSet,
           current_step: "results",
-          selfie_url: selfieUrl,
+          selfie_url: selfieUrl, // keep latest for UI/debug
+          document_url: `s3://${BUCKET}/${docKey}`, // keep latest for UI/debug
           is_verified: overallVerified,
           verification_score: verificationScore,
           liveness_score: livenessScore,
@@ -775,12 +794,14 @@ export default async function handler(req, res) {
 
       return res.json({
         success: true,
+        guest_index: guestIndex,
         is_verified: overallVerified,
         expected_guest_count: expected,
         verified_guest_count: verifiedAfter,
         requires_additional_guest: requiresAdditionalGuest,
         remaining_guest_verifications: Math.max(expected - verifiedAfter, 0),
         data: {
+          guest_index: guestIndex,
           liveness_score: livenessScore,
           face_match_score: similarity,
           verification_score: verificationScore,
