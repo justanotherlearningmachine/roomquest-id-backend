@@ -1,1 +1,5 @@
-Opsian Technologies LLC. Identify Verifcation version 3.0
+Face Identity Verifcation
+version 3.0
+
+
+Opsian Technologies LLC
